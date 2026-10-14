@@ -1,0 +1,17 @@
+# Output and artifacts
+AuditOutput/
+*.json
+*.json.sha256
+*.csv
+*.log
+
+# PowerShell
+*.ps1xml
+*.clixml
+*.pspki
+
+# Editor artifacts
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
