@@ -14,8 +14,9 @@ Describe 'Invoke-M365EntraAudit' {
             $script:Report = $script:RawJson | ConvertFrom-Json
         }
 
-        It 'returns a completed status object' {
+        It 'returns a completed status object with v1.1.0 metadata' {
             $script:Result.Status | Should -Be 'Completed'
+            $script:Report.Metadata.ToolVersion | Should -Be '1.1.0'
         }
 
         It 'creates the primary JSON artifact and SHA256 sidecar file' {
@@ -25,7 +26,7 @@ Describe 'Invoke-M365EntraAudit' {
 
         It 'contains all expected top-level sections in JSON' {
             $script:Report.PSObject.Properties.Name |
-                Should -Be @('Metadata', 'Summary', 'StaleGuests', 'PrivilegedRoles', 'InactiveLicenses', 'EndpointCompliance')
+                Should -Be @('Metadata', 'Summary', 'StaleGuests', 'PrivilegedRoles', 'InactiveLicenses', 'EndpointCompliance', 'ConditionalAccess')
         }
 
         It 'audits stale guest accounts correctly' {
@@ -33,8 +34,16 @@ Describe 'Invoke-M365EntraAudit' {
             $script:Report.StaleGuests[0].StatusFlag | Should -Be 'StaleGuest'
         }
 
-        It 'identifies non-compliant endpoints' {
+        It 'identifies non-compliant endpoints and BitLocker status' {
             $script:Result.NonCompliantDeviceCount | Should -BeGreaterThan 0
+            $nonCompliant = $script:Report.EndpointCompliance | Where-Object { $_.DeviceName -eq 'WKSTN-FIN-01' }
+            $nonCompliant.IsEncrypted | Should -BeFalse
+        }
+
+        It 'audits Conditional Access posture for disabled or report-only policies' {
+            $script:Result.AtRiskCaPolicyCount | Should -Be 2
+            $reportOnly = $script:Report.ConditionalAccess | Where-Object { $_.State -eq 'enabledForReportingButNotEnforced' }
+            $reportOnly.PostureRisk | Should -Be 'PolicyInReportOnlyMode'
         }
 
         It 'verifies sidecar SHA256 integrity hash matches the artifact' {
@@ -42,8 +51,8 @@ Describe 'Invoke-M365EntraAudit' {
             (Get-Content -LiteralPath $script:Result.HashFile -Raw) | Should -Match "^$computed\s"
         }
 
-        It 'exports CSV files when -ExportCsv is specified' {
-            Get-ChildItem -Path $script:OutDir -Filter "*.csv" | Measure-Object | Select-Object -ExpandProperty Count | Should -Be 4
+        It 'exports all 5 CSV files when -ExportCsv is specified' {
+            Get-ChildItem -Path $script:OutDir -Filter "*.csv" | Measure-Object | Select-Object -ExpandProperty Count | Should -Be 5
         }
     }
 }

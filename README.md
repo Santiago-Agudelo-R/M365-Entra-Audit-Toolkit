@@ -10,12 +10,13 @@ Automated PowerShell governance and security auditor for Microsoft 365, Microsof
 
 ## Overview
 
-Maintaining hygiene across cloud and hybrid Microsoft enterprise tenants is critical to preventing unauthorized persistence and minimizing licensing overhead. `M365-Entra-Audit-Toolkit` provides an automated, modular PowerShell auditor designed for systems administrators and security operations teams to evaluate four critical governance domains:
+Maintaining hygiene across cloud and hybrid Microsoft enterprise tenants is critical to preventing unauthorized persistence and minimizing licensing overhead. `M365-Entra-Audit-Toolkit` provides an automated, modular PowerShell auditor designed for systems administrators and security operations teams to evaluate five critical governance domains:
 
-1. **Stale Guest Accounts:** Identifies external vendor and partner accounts with no interactive sign-ins over a configurable threshold (default: 90 days).
-2. **Privileged Roles Governance:** Audits permanent assignments to high-risk roles (Global Administrator, Privileged Role Administrator) versus Privileged Identity Management (PIM) eligibility.
-3. **License Optimization:** Flags active Microsoft 365 licenses assigned to disabled or long-inactive accounts to eliminate unnecessary recurring costs.
-4. **Intune Endpoint Posture:** Extracts non-compliant managed devices and flags workstations with missing encryption baselines (BitLocker).
+1. **Stale Guest Accounts:** Identifies external vendor and partner accounts with no interactive sign-ins over a configurable threshold (default: 90 days) via `SignInActivity`.
+2. **Privileged Roles Governance:** Audits permanent assignments to high-risk roles (`Global Administrator`, `Privileged Role Administrator`, `Security Administrator`, `Intune Administrator`) and flags direct `ServicePrincipal` assignments.
+3. **License Optimization:** Flags active Microsoft 365 licenses assigned to disabled (`AccountEnabled = false`) or long-inactive accounts to eliminate recurring licensing waste.
+4. **Intune Endpoint Posture:** Extracts non-compliant managed devices (`Get-MgDeviceManagementManagedDevice`) and flags workstations with missing BitLocker encryption (`IsEncrypted = false`).
+5. **Conditional Access Posture:** Evaluates Entra ID Conditional Access policies (`Get-MgIdentityConditionalAccessPolicy`) to identify policies left in `enabledForReportingButNotEnforced` (Report-Only) or `disabled` states.
 
 All extracted timestamps are normalized to ISO 8601 UTC. Outputs are delivered in structured JSON accompanied by a `.sha256` integrity sidecar file, with optional CSV exports.
 
@@ -32,7 +33,7 @@ All extracted timestamps are normalized to ISO 8601 UTC. Outputs are delivered i
                                      ┌────────────────────┴────────────────────┐
                                      ▼                                         ▼
                         [Hashed JSON Artifact]                     [Segmented CSV Reports]
-                        (Metadata + SHA256 Sidecar)                (Guests, Roles, Licenses, Intune)
+                        (Metadata + SHA256 Sidecar)          (Guests, Roles, Licenses, Intune, CA)
 ```
 
 ---
@@ -42,12 +43,13 @@ All extracted timestamps are normalized to ISO 8601 UTC. Outputs are delivered i
 ### Minimum Requirements
 - Windows 10/11 or Windows Server 2016+
 - PowerShell 5.1 or PowerShell 7+
-- Microsoft Graph PowerShell SDK (`Microsoft.Graph.Users`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.DeviceManagement`)
+- Microsoft Graph PowerShell SDK (`Microsoft.Graph.Users`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.DeviceManagement`, `Microsoft.Graph.Identity.SignIns`)
 
 ### Required Microsoft Graph Scopes (Live Execution)
 - `User.Read.All`
 - `Directory.Read.All`
 - `DeviceManagementManagedDevices.Read.All`
+- `Policy.Read.All`
 - `AuditLog.Read.All`
 
 ---
@@ -67,7 +69,7 @@ Evaluate the tool immediately using built-in synthetic enterprise telemetry:
 
 ### 3. Live Tenant Execution
 ```powershell
-Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "DeviceManagementManagedDevices.Read.All"
+Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "DeviceManagementManagedDevices.Read.All", "Policy.Read.All", "AuditLog.Read.All"
 .\src\Invoke-M365EntraAudit.ps1 -ExportCsv
 ```
 
@@ -79,8 +81,8 @@ Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "DeviceManagement
 {
   "Metadata": {
     "ToolName": "M365-Entra-Audit-Toolkit",
-    "ToolVersion": "1.0.0",
-    "TimestampUtc": "2026-10-13T23:15:00.1234567Z",
+    "ToolVersion": "1.1.0",
+    "TimestampUtc": "2026-10-18T23:15:00.1234567Z",
     "InactiveDaysThreshold": 90,
     "ExecutionMode": "DemoMode"
   },
@@ -88,7 +90,8 @@ Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "DeviceManagement
     "TotalStaleGuestsFound": 2,
     "TotalPrivilegedAssignments": 3,
     "TotalReclaimableLicenses": 2,
-    "TotalNonCompliantEndpoints": 2
+    "TotalNonCompliantEndpoints": 2,
+    "TotalAtRiskCaPolicies": 2
   },
   "StaleGuests": [
     {
@@ -107,6 +110,14 @@ Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "DeviceManagement
       "IsPimEligible": false,
       "MfaRegistered": true,
       "ComplianceRisk": "PermanentGlobalAdminAssignment"
+    }
+  ],
+  "ConditionalAccess": [
+    {
+      "PolicyName": "CA04-Require-Compliant-Device-Finance",
+      "State": "enabledForReportingButNotEnforced",
+      "GrantControls": "compliantDevice",
+      "PostureRisk": "PolicyInReportOnlyMode"
     }
   ]
 }
