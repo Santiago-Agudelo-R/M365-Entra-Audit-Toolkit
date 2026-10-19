@@ -26,7 +26,7 @@ jobs:
           }
 
   test:
-    name: Pester ({{ matrix.shell }})
+    name: Pester (${{ matrix.shell }})
     runs-on: windows-latest
     strategy:
       fail-fast: false
