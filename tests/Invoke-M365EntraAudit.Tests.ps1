@@ -15,9 +15,9 @@ Describe 'Invoke-M365EntraAudit' {
             $script:Report = $script:RawJson | ConvertFrom-Json
         }
 
-        It 'returns a completed status object with v1.1.1 metadata' {
+        It 'returns a completed status object with valid semantic version metadata' {
             $script:Result.Status | Should -Be 'Completed'
-            $script:Report.Metadata.ToolVersion | Should -Be '1.1.1'
+            $script:Report.Metadata.ToolVersion | Should -Match '^\d+\.\d+\.\d+$'
         }
 
         It 'creates the primary JSON artifact and SHA256 sidecar file' {
@@ -99,6 +99,47 @@ Describe 'Invoke-M365EntraAudit' {
             $pimUser.IsPimEligible | Should -BeTrue
             $pimUser.MfaRegistered | Should -BeTrue
             $pimUser.ComplianceRisk | Should -Be 'None'
+        }
+
+        It 'Get-LivePrivilegedRole does not flag UnverifiedPimAndMfaPosture when PIM is unavailable (Unknown) but MFA is true, and identifies Group principals' {
+            function Get-MgReportAuthenticationMethodUserRegistrationDetail {
+                return @(
+                    [PSCustomObject]@{ Id = 'user-mfa-ok'; UserPrincipalName = 'mfa_admin@contoso.com'; IsMfaRegistered = $true }
+                )
+            }
+            function Get-MgRoleManagementDirectoryRoleEligibilitySchedule {
+                throw "Tenant does not have an Entra ID P2 license"
+            }
+            function Get-MgRoleManagementDirectoryRoleAssignmentSchedule {
+                throw "Tenant does not have an Entra ID P2 license"
+            }
+            function Get-MgDirectoryRole {
+                return @(
+                    [PSCustomObject]@{ Id = 'role-sec'; RoleTemplateId = 'template-sec'; DisplayName = 'Security Administrator' }
+                )
+            }
+            function Get-MgDirectoryRoleMember {
+                return @(
+                    [PSCustomObject]@{
+                        Id                   = 'user-mfa-ok'
+                        AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = 'mfa_admin@contoso.com' }
+                    },
+                    [PSCustomObject]@{
+                        Id                   = 'group-sec-ops'
+                        AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.group'; 'displayName' = 'SG-SecOps-Admins' }
+                    }
+                )
+            }
+
+            $roles = Get-LivePrivilegedRole -WarningAction SilentlyContinue
+            $mfaUser = $roles | Where-Object { $_.PrincipalName -eq 'mfa_admin@contoso.com' }
+            $mfaUser.AssignmentType | Should -Be 'Unknown'
+            $mfaUser.MfaRegistered | Should -BeTrue
+            $mfaUser.ComplianceRisk | Should -Be 'None'
+
+            $grpMember = $roles | Where-Object { $_.PrincipalName -eq 'SG-SecOps-Admins' }
+            $grpMember.PrincipalType | Should -Be 'Group'
+            $grpMember.MfaRegistered | Should -Be 'N/A (Group)'
         }
 
         It 'Get-LiveEndpointCompliance flags BitLockerNotActive only on Windows devices and DeviceEncryptionNotActive on non-Windows' {

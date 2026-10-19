@@ -321,7 +321,11 @@ function Get-LivePrivilegedRole {
                 [string]$member.Id
             }
 
-            $principalType = if ($odataType -eq '#microsoft.graph.servicePrincipal') { "ServicePrincipal" } else { "User" }
+            $principalType = switch ($odataType) {
+                '#microsoft.graph.servicePrincipal' { "ServicePrincipal" }
+                '#microsoft.graph.group'            { "Group" }
+                default                             { "User" }
+            }
             $scheduleKey = "${roleTemplateId}:$($member.Id)"
 
             # Determine PIM assignment status without fabricating values
@@ -347,6 +351,9 @@ function Get-LivePrivilegedRole {
             if ($principalType -eq "ServicePrincipal") {
                 $mfaStatus = "N/A (ServicePrincipal)"
             }
+            elseif ($principalType -eq "Group") {
+                $mfaStatus = "N/A (Group)"
+            }
             elseif ($mfaTelemetryAvailable) {
                 $upnKey = $principalName.ToLowerInvariant()
                 $idKey = ([string]$member.Id).ToLowerInvariant()
@@ -363,7 +370,7 @@ function Get-LivePrivilegedRole {
             if ($principalType -eq "ServicePrincipal") {
                 $riskReasons.Add("ServicePrincipalDirectRoleAssignment")
             }
-            if ($mfaStatus -eq $false) {
+            if ($mfaStatus -is [bool] -and (-not $mfaStatus)) {
                 $riskReasons.Add("PrivilegedAccountWithoutMfa")
             }
             if ($assignmentType -eq "Permanent") {
@@ -374,7 +381,7 @@ function Get-LivePrivilegedRole {
                     $riskReasons.Add("PermanentHighPrivilegeAssignment")
                 }
             }
-            elseif ($assignmentType -eq "Unknown" -and $mfaStatus -eq "Unknown") {
+            elseif ($assignmentType -eq "Unknown" -and "Unknown" -eq $mfaStatus) {
                 $riskReasons.Add("UnverifiedPimAndMfaPosture")
             }
 
