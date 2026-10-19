@@ -7,39 +7,50 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   lint:
-    name: PSScriptAnalyzer
+    name: Lint
     runs-on: windows-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Run PSScriptAnalyzer
         shell: pwsh
         run: |
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
           $results = Invoke-ScriptAnalyzer -Path ./src/Invoke-M365EntraAudit.ps1 -Severity Error,Warning
           if ($results) {
-              $results | Format-Table -AutoSize
-              throw "PSScriptAnalyzer found $($results.Count) issue(s)."
+            $results | Format-Table RuleName, Severity, ScriptName, Line, Message -AutoSize -Wrap
+            Write-Error "PSScriptAnalyzer found $($results.Count) error/warning finding(s)."
+            exit 1
           }
+          Write-Output "No blocking findings."
 
   test:
-    name: Pester (${{ matrix.shell }})
+    name: Pester Tests
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shell: [ pwsh, powershell ]
+    needs: lint
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Run Pester tests
-        shell: ${{ matrix.shell }}
+      - name: Run Pester tests (PowerShell Core 7)
+        shell: pwsh
         run: |
-          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Import-Module Pester -MinimumVersion 5.5.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = './tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $config
+
+      - name: Run Pester tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
           Import-Module Pester -MinimumVersion 5.5.0
           $config = New-PesterConfiguration
           $config.Run.Path = './tests'
