@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-11-09
+
+### Fixed
+- **Privileged role risk evaluation:** Comparing a verified MFA value (`$true`) with `"Unknown"` was coerced to `$true` by PowerShell, so admins with confirmed MFA were flagged `UnverifiedPimAndMfaPosture` when PIM data was unavailable. The comparison now puts the string on the left side.
+- **Group principals:** Role assignments to role-assignable groups are now reported as `PrincipalType = "Group"` instead of `"User"`.
+
 ## [1.1.1] - 2026-10-18
 
 ### Fixed

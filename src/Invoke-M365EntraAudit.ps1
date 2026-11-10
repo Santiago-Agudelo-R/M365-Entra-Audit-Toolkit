@@ -560,7 +560,7 @@ if (-not (Test-Path -LiteralPath $OutputDirectory)) {
 $summaryReport = [PSCustomObject]@{
     Metadata = [PSCustomObject]@{
         ToolName              = "M365-Entra-Audit-Toolkit"
-        ToolVersion           = "1.1.1"
+        ToolVersion           = "1.1.2"
         TimestampUtc          = $executionTimestampUtc
         InactiveDaysThreshold = $InactiveDaysThreshold
         ExecutionMode         = $effectiveMode
