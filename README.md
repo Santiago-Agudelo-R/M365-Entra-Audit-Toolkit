@@ -78,24 +78,25 @@ Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "RoleManagement.R
 
 ---
 
-## Sample Output (`M365_Entra_Audit_*.json`)
+## Sample Output (`M365Audit_<timestamp>.json`)
+
+Real output of `.\src\Invoke-M365EntraAudit.ps1 -DemoMode` (metadata and summary; the detail sections `StaleGuests`, `PrivilegedRoles`, `InactiveLicenses`, `EndpointCompliance`, and `ConditionalAccess` follow in the same file):
 
 ```json
 {
-  "AuditMetadata": {
+  "Metadata": {
     "ToolName": "M365-Entra-Audit-Toolkit",
-    "Version": "1.1.2",
-    "TimestampUtc": "2026-11-13T18:30:00Z",
-    "ExecutionMode": "DemoSimulation",
-    "InactiveThresholdDays": 90
+    "ToolVersion": "1.1.2",
+    "TimestampUtc": "2026-11-14T04:07:45.2597788Z",
+    "InactiveDaysThreshold": 90,
+    "ExecutionMode": "DemoMode"
   },
-  "ExecutiveSummary": {
-    "StaleGuestCount": 2,
-    "PermanentGlobalAdminCount": 2,
-    "PrivilegedUsersWithoutMFA": 1,
-    "WastedLicenseAccountCount": 2,
-    "NonCompliantIntuneDevices": 2,
-    "UnenforcedConditionalAccessPolicies": 2
+  "Summary": {
+    "TotalStaleGuestsFound": 2,
+    "TotalPrivilegedAssignments": 3,
+    "TotalReclaimableLicenses": 2,
+    "TotalNonCompliantEndpoints": 2,
+    "TotalAtRiskCaPolicies": 2
   }
 }
 ```
