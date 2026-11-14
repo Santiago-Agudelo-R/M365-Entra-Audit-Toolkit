@@ -2,6 +2,7 @@
 
 Automated PowerShell governance and security auditor for Microsoft 365, Microsoft Entra ID, and Microsoft Intune.
 
+[![CI](https://github.com/Santiago-Agudelo-R/M365-Entra-Audit-Toolkit/actions/workflows/ci.yml/badge.svg)](https://github.com/Santiago-Agudelo-R/M365-Entra-Audit-Toolkit/actions)
 [![PowerShell 5.1 / 7+](https://img.shields.io/badge/PowerShell-5.1%20%7C%207%2B-blue.svg)](https://microsoft.com/PowerShell)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/Santiago-Agudelo-R/M365-Entra-Audit-Toolkit?color=success)](https://github.com/Santiago-Agudelo-R/M365-Entra-Audit-Toolkit/releases)
@@ -73,6 +74,30 @@ Live execution requires an active Microsoft Graph session and terminates with an
 ```powershell
 Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "RoleManagement.Read.Directory", "UserAuthenticationMethod.Read.All", "DeviceManagementManagedDevices.Read.All", "Policy.Read.All", "AuditLog.Read.All"
 .\src\Invoke-M365EntraAudit.ps1 -ExportCsv
+```
+
+---
+
+## Sample Output (`M365_Entra_Audit_*.json`)
+
+```json
+{
+  "AuditMetadata": {
+    "ToolName": "M365-Entra-Audit-Toolkit",
+    "Version": "1.1.2",
+    "TimestampUtc": "2026-11-13T18:30:00Z",
+    "ExecutionMode": "DemoSimulation",
+    "InactiveThresholdDays": 90
+  },
+  "ExecutiveSummary": {
+    "StaleGuestCount": 2,
+    "PermanentGlobalAdminCount": 2,
+    "PrivilegedUsersWithoutMFA": 1,
+    "WastedLicenseAccountCount": 2,
+    "NonCompliantIntuneDevices": 2,
+    "UnenforcedConditionalAccessPolicies": 2
+  }
+}
 ```
 
 ---
