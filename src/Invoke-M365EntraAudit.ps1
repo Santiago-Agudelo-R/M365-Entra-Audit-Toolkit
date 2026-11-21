@@ -3,18 +3,22 @@
     Automated hygiene and governance auditor for Microsoft 365, Entra ID, and Intune.
 
 .DESCRIPTION
-    Invoke-M365EntraAudit audits five critical governance domains across cloud and hybrid tenants:
-    1. Stale guest accounts (>60/90 days without interactive sign-in).
+    Invoke-M365EntraAudit audits six critical governance domains across cloud and hybrid tenants:
+    1. Stale guest accounts (>60/90 days without interactive or non-interactive sign-in).
     2. High-privilege role assignments (Global Administrator, Security Administrator, Intune Administrator),
-       evaluating permanent vs PIM-eligible schedules and querying MFA registration status.
-    3. Inactive licensed accounts (license optimization and disabled account reclamation).
+       evaluating permanent vs time-bound vs PIM-eligible (both active and inactive eligible) schedules
+       and querying MFA registration status.
+    3. Inactive licensed accounts (evaluating interactive, non-interactive, and lastSuccessfulSignInDateTime,
+       using CreatedDateTime as the baseline for accounts that have never signed in, and resolving SKU names).
     4. Intune endpoint compliance posture and missing BitLocker encryption on Windows devices.
-    5. Conditional Access policy posture (detecting disabled or report-only policies).
+    5. Conditional Access policy posture (detecting disabled/report-only policies, scope coverage, and
+       excessive or missing break-glass exclusions).
+    6. OAuth application registrations and enterprise app permission grants (high-risk scopes and expiring secrets).
 
     Live execution requires an authenticated Microsoft Graph session (Connect-MgGraph) and stops
     with an explicit error if no session is active. For offline testing or CI pipelines without
     tenant credentials, pass the -DemoMode switch explicitly.
-    All dates are strictly formatted in ISO 8601 UTC.
+    All dates are strictly formatted in ISO 8601 UTC, and CSV exports sanitize formula-injection prefixes.
 
 .PARAMETER OutputDirectory
     Directory to export JSON and CSV audit artifacts. Defaults to "$PSScriptRoot\AuditOutput".
@@ -30,13 +34,6 @@
 
 .PARAMETER LoadFunctionsOnly
     Loads internal audit functions into the caller scope without executing the main entrypoint (used by Pester unit tests).
-
-.EXAMPLE
-    .\Invoke-M365EntraAudit.ps1 -DemoMode
-
-.EXAMPLE
-    Connect-MgGraph -Scopes "User.Read.All","Directory.Read.All","RoleManagement.Read.Directory","UserAuthenticationMethod.Read.All","DeviceManagementManagedDevices.Read.All","Policy.Read.All","AuditLog.Read.All"
-    .\Invoke-M365EntraAudit.ps1 -OutputDirectory "C:\Audits\M365" -InactiveDaysThreshold 60 -ExportCsv
 
 .NOTES
     Author: Santiago Agudelo
@@ -65,6 +62,123 @@ param (
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Protect-CsvValue {
+    <#
+        Prevents CSV / Excel formula injection (CWE-1236) when untrusted directory fields
+        (such as external guest DisplayName) begin with =, +, -, @, tab, or carriage return.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param (
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($null -eq $Value -or ($Value -isnot [string])) {
+        return $Value
+    }
+
+    $str = [string]$Value
+    if ($str -match '^[=+\-@\t\r]' -and ($str -notmatch '^-\d+(\.\d+)?$')) {
+        return "'$str"
+    }
+    return $str
+}
+
+function ConvertTo-SafeCsvRecord {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$InputObjects
+    )
+
+    $safeList = [System.Collections.Generic.List[PSObject]]::new()
+    foreach ($obj in $InputObjects) {
+        if ($null -eq $obj) { continue }
+        $ordered = [ordered]@{}
+        foreach ($prop in $obj.PSObject.Properties) {
+            $ordered[$prop.Name] = Protect-CsvValue -Value $prop.Value
+        }
+        $safeList.Add([PSCustomObject]$ordered)
+    }
+    return , $safeList.ToArray()
+}
+
+function Get-MostRecentSignInDateUtc {
+    <#
+        Evaluates all available Microsoft Graph SignInActivity timestamps:
+        - LastSuccessfulSignInDateTime
+        - LastSignInDateTime (interactive)
+        - LastNonInteractiveSignInDateTime (token refresh / background apps)
+        Returns the most recent [DateTime] in UTC, or $null if the user has never signed in.
+    #>
+    [CmdletBinding()]
+    [OutputType([Nullable[DateTime]])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [PSObject]$User
+    )
+
+    if (-not ($User.PSObject.Properties['SignInActivity'] -and $User.SignInActivity)) {
+        return $null
+    }
+
+    $act = $User.SignInActivity
+    $candidates = [System.Collections.Generic.List[DateTime]]::new()
+
+    foreach ($propName in @('LastSuccessfulSignInDateTime', 'LastSignInDateTime', 'LastNonInteractiveSignInDateTime')) {
+        if ($act.PSObject.Properties[$propName] -and $act.$propName) {
+            $candidates.Add(([DateTime]$act.$propName).ToUniversalTime())
+        }
+    }
+
+    if ($candidates.Count -eq 0) {
+        return $null
+    }
+
+    return ($candidates | Sort-Object -Descending | Select-Object -First 1)
+}
+
+function Resolve-FriendlySkuName {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$SkuIdentifier,
+
+        [Parameter(Mandatory = $false)]
+        [hashtable]$TenantSkuMap = @{}
+    )
+
+    $friendlyTable = @{
+        'SPE_E5'            = 'Microsoft 365 E5'
+        'SPE_E3'            = 'Microsoft 365 E3'
+        'SPE_F1'            = 'Microsoft 365 F3'
+        'ENTERPRISEPREMIUM' = 'Office 365 E5'
+        'ENTERPRISEPACK'    = 'Office 365 E3'
+        'AAD_PREMIUM_P2'    = 'Microsoft Entra ID P2'
+        'AAD_PREMIUM'       = 'Microsoft Entra ID P1'
+        'EMSPREMIUM'        = 'Enterprise Mobility + Security E5'
+        'EMS'               = 'Enterprise Mobility + Security E3'
+        'SPB'               = 'Microsoft 365 Business Premium'
+    }
+
+    $partNumber = if ($TenantSkuMap.ContainsKey($SkuIdentifier)) {
+        [string]$TenantSkuMap[$SkuIdentifier]
+    }
+    else {
+        $SkuIdentifier
+    }
+
+    if ($friendlyTable.ContainsKey($partNumber.ToUpperInvariant())) {
+        return $friendlyTable[$partNumber.ToUpperInvariant()]
+    }
+    return $partNumber
+}
 
 function Get-MockTelemetry {
     [CmdletBinding()]
@@ -110,7 +224,7 @@ function Get-MockTelemetry {
             RoleName       = "Security Administrator"
             PrincipalName  = "soc_lead@contoso.com"
             PrincipalType  = "User"
-            AssignmentType = "Eligible (PIM)"
+            AssignmentType = "Eligible (Inactive)"
             IsPimEligible  = $true
             MfaRegistered  = $true
             ComplianceRisk = "None"
@@ -179,22 +293,49 @@ function Get-MockTelemetry {
 
     $conditionalAccess = @(
         [PSCustomObject]@{
-            PolicyName    = "CA01-Require-MFA-All-Users"
-            State         = "enabled"
-            GrantControls = "mfa"
-            PostureRisk   = "None"
+            PolicyName         = "CA01-Require-MFA-All-Users"
+            State              = "enabled"
+            IncludeUsersScope  = "All"
+            ExcludedUsersCount = 2
+            GrantControls      = "mfa"
+            PostureRisk        = "None"
         },
         [PSCustomObject]@{
-            PolicyName    = "CA04-Require-Compliant-Device-Finance"
-            State         = "enabledForReportingButNotEnforced"
-            GrantControls = "compliantDevice"
-            PostureRisk   = "PolicyInReportOnlyMode"
+            PolicyName         = "CA04-Require-Compliant-Device-Finance"
+            State              = "enabledForReportingButNotEnforced"
+            IncludeUsersScope  = "Groups"
+            ExcludedUsersCount = 0
+            GrantControls      = "compliantDevice"
+            PostureRisk        = "PolicyInReportOnlyMode"
         },
         [PSCustomObject]@{
-            PolicyName    = "CA07-Block-Legacy-Authentication"
-            State         = "disabled"
-            GrantControls = "block"
-            PostureRisk   = "PolicyDisabled"
+            PolicyName         = "CA07-Block-Legacy-Authentication"
+            State              = "disabled"
+            IncludeUsersScope  = "All"
+            ExcludedUsersCount = 0
+            GrantControls      = "block"
+            PostureRisk        = "PolicyDisabled"
+        }
+    )
+
+    $appRegistrations = @(
+        [PSCustomObject]@{
+            AppDisplayName      = "Legacy-Mail-Sync-Connector"
+            AppId               = "11111111-2222-3333-4444-555555555555"
+            ConsentType         = "AllPrincipals (AdminConsent)"
+            GrantedPermissions  = "Mail.ReadWrite; Mail.Send; User.Read.All"
+            CredentialExpiryUtc = $nowUtc.AddDays(-12).ToString("o")
+            DaysUntilExpiry     = -12
+            GovernanceRisk      = "HighRiskOAuthPermissions; ExpiredClientSecret"
+        },
+        [PSCustomObject]@{
+            AppDisplayName      = "HR-Onboarding-Automation"
+            AppId               = "66666666-7777-8888-9999-000000000000"
+            ConsentType         = "AllPrincipals (AdminConsent)"
+            GrantedPermissions  = "Directory.ReadWrite.All"
+            CredentialExpiryUtc = $nowUtc.AddDays(14).ToString("o")
+            DaysUntilExpiry     = 14
+            GovernanceRisk      = "HighRiskOAuthPermissions; CredentialExpiringSoon"
         }
     )
 
@@ -204,6 +345,7 @@ function Get-MockTelemetry {
         InactiveLicenses   = $inactiveLicenses
         EndpointCompliance = $endpointCompliance
         ConditionalAccess  = $conditionalAccess
+        AppRegistrations   = $appRegistrations
     }
 }
 
@@ -217,13 +359,9 @@ function Get-LiveStaleGuest {
 
     $guests = Get-MgUser -Filter "userType eq 'Guest'" -Property Id, UserPrincipalName, DisplayName, AccountEnabled, CreatedDateTime, SignInActivity -All -ErrorAction Stop
     foreach ($user in $guests) {
-        $lastSignIn = $null
-        if ($user.PSObject.Properties['SignInActivity'] -and $user.SignInActivity -and $user.SignInActivity.LastSignInDateTime) {
-            $lastSignIn = ([DateTime]$user.SignInActivity.LastSignInDateTime).ToUniversalTime()
-        }
-
-        $createdUtc = if ($user.CreatedDateTime) { ([DateTime]$user.CreatedDateTime).ToUniversalTime() } else { $nowUtc }
-        $referenceDate = if ($lastSignIn) { $lastSignIn } else { $createdUtc }
+        $lastSignIn = Get-MostRecentSignInDateUtc -User $user
+        $createdUtc = if ($user.PSObject.Properties['CreatedDateTime'] -and $user.CreatedDateTime) { ([DateTime]$user.CreatedDateTime).ToUniversalTime() } else { $nowUtc }
+        $referenceDate = if ($null -ne $lastSignIn) { $lastSignIn } else { $createdUtc }
         $daysInactive = [int][Math]::Floor(($nowUtc - $referenceDate).TotalDays)
 
         if ($daysInactive -ge $ThresholdDays) {
@@ -232,7 +370,7 @@ function Get-LiveStaleGuest {
                 DisplayName           = $user.DisplayName
                 AccountEnabled        = [bool]$user.AccountEnabled
                 CreatedDateTimeUtc    = $createdUtc.ToString("o")
-                LastSignInDateTimeUtc = if ($lastSignIn) { $lastSignIn.ToString("o") } else { "NeverSignedIn" }
+                LastSignInDateTimeUtc = if ($null -ne $lastSignIn) { $lastSignIn.ToString("o") } else { "NeverSignedIn" }
                 DaysInactive          = $daysInactive
                 StatusFlag            = "StaleGuest"
             })
@@ -257,7 +395,7 @@ function Get-LivePrivilegedRole {
         "Conditional Access Administrator"
     )
 
-    # 1. Query real MFA registration telemetry (never assume $true if unavailable)
+    # 1. Query real MFA registration telemetry
     $mfaLookup = @{}
     $mfaTelemetryAvailable = $false
     if (Get-Command -Name Get-MgReportAuthenticationMethodUserRegistrationDetail -ErrorAction SilentlyContinue) {
@@ -278,24 +416,24 @@ function Get-LivePrivilegedRole {
         }
     }
 
-    # 2. Query PIM Eligibility and Assignment Schedules when available (Entra ID P2)
-    $pimEligibleKeys = @{}
-    $pimPermanentKeys = @{}
+    # 2. Query PIM Eligibility and Assignment Schedules (Entra ID P2)
+    $pimEligibleByKey = @{}
+    $pimAssignmentByKey = @{}
     $pimTelemetryAvailable = $false
 
     if ((Get-Command -Name Get-MgRoleManagementDirectoryRoleEligibilitySchedule -ErrorAction SilentlyContinue) -and
         (Get-Command -Name Get-MgRoleManagementDirectoryRoleAssignmentSchedule -ErrorAction SilentlyContinue)) {
         try {
-            $eligSchedules = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -All -ErrorAction Stop
+            $eligSchedules = @(Get-MgRoleManagementDirectoryRoleEligibilitySchedule -All -ErrorAction Stop)
             foreach ($s in $eligSchedules) {
-                $pimEligibleKeys["$($s.RoleDefinitionId):$($s.PrincipalId)"] = $true
+                $key = "$($s.RoleDefinitionId):$($s.PrincipalId)"
+                $pimEligibleByKey[$key] = $s
             }
 
-            $assignSchedules = Get-MgRoleManagementDirectoryRoleAssignmentSchedule -All -ErrorAction Stop
+            $assignSchedules = @(Get-MgRoleManagementDirectoryRoleAssignmentSchedule -All -ErrorAction Stop)
             foreach ($a in $assignSchedules) {
-                if ($a.AssignmentType -eq 'Assigned' -and (-not $pimEligibleKeys.ContainsKey("$($a.RoleDefinitionId):$($a.PrincipalId)"))) {
-                    $pimPermanentKeys["$($a.RoleDefinitionId):$($a.PrincipalId)"] = $true
-                }
+                $key = "$($a.RoleDefinitionId):$($a.PrincipalId)"
+                $pimAssignmentByKey[$key] = $a
             }
             $pimTelemetryAvailable = $true
         }
@@ -304,18 +442,57 @@ function Get-LivePrivilegedRole {
         }
     }
 
-    $roles = Get-MgDirectoryRole -All -ErrorAction Stop | Where-Object { $_.DisplayName -in $targetRoles }
+    $roles = @(Get-MgDirectoryRole -All -ErrorAction Stop | Where-Object { $_.DisplayName -in $targetRoles })
     foreach ($role in $roles) {
-        $roleTemplateId = if ($role.PSObject.Properties['RoleTemplateId'] -and $role.RoleTemplateId) { $role.RoleTemplateId } else { $role.Id }
-        $members = Get-MgDirectoryRoleMember -DirectoryRoleId $role.Id -All -ErrorAction Stop
+        $roleTemplateId = if ($role.PSObject.Properties['RoleTemplateId'] -and $role.RoleTemplateId) { [string]$role.RoleTemplateId } else { [string]$role.Id }
+        $activeMembers = @(Get-MgDirectoryRoleMember -DirectoryRoleId $role.Id -All -ErrorAction Stop)
 
-        foreach ($member in $members) {
-            $odataType = $member.AdditionalProperties['@odata.type']
-            $principalName = if ($member.AdditionalProperties.ContainsKey('userPrincipalName')) {
-                [string]$member.AdditionalProperties['userPrincipalName']
+        # Build a combined dictionary of principals for this role: active members + inactive PIM-eligible principals
+        $principalsById = [ordered]@{}
+        foreach ($m in $activeMembers) {
+            $principalsById[[string]$m.Id] = [PSCustomObject]@{
+                MemberObject = $m
+                IsActiveNow  = $true
             }
-            elseif ($member.AdditionalProperties.ContainsKey('displayName')) {
-                [string]$member.AdditionalProperties['displayName']
+        }
+
+        if ($pimTelemetryAvailable) {
+            foreach ($eligKey in $pimEligibleByKey.Keys) {
+                $eligObj = $pimEligibleByKey[$eligKey]
+                if ([string]$eligObj.RoleDefinitionId -eq $roleTemplateId) {
+                    $pId = [string]$eligObj.PrincipalId
+                    if (-not $principalsById.Contains($pId)) {
+                        $synthProps = if ($eligObj.PSObject.Properties['Principal'] -and $eligObj.Principal -and $eligObj.Principal.PSObject.Properties['AdditionalProperties']) {
+                            $eligObj.Principal.AdditionalProperties
+                        }
+                        elseif ($eligObj.PSObject.Properties['PrincipalPrincipalName'] -and $eligObj.PrincipalPrincipalName) {
+                            @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = [string]$eligObj.PrincipalPrincipalName }
+                        }
+                        else {
+                            @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = $pId }
+                        }
+                        $principalsById[$pId] = [PSCustomObject]@{
+                            MemberObject = [PSCustomObject]@{ Id = $pId; AdditionalProperties = $synthProps }
+                            IsActiveNow  = $false
+                        }
+                    }
+                }
+            }
+        }
+
+        foreach ($pId in $principalsById.Keys) {
+            $entryInfo = $principalsById[$pId]
+            $member = $entryInfo.MemberObject
+            $isActiveNow = [bool]$entryInfo.IsActiveNow
+
+            $addProps = if ($member.PSObject.Properties['AdditionalProperties'] -and $member.AdditionalProperties) { $member.AdditionalProperties } else { @{} }
+            $odataType = if ($addProps.ContainsKey('@odata.type')) { $addProps['@odata.type'] } else { '#microsoft.graph.user' }
+
+            $principalName = if ($addProps.ContainsKey('userPrincipalName')) {
+                [string]$addProps['userPrincipalName']
+            }
+            elseif ($addProps.ContainsKey('displayName')) {
+                [string]$addProps['displayName']
             }
             else {
                 [string]$member.Id
@@ -326,27 +503,41 @@ function Get-LivePrivilegedRole {
                 '#microsoft.graph.group'            { "Group" }
                 default                             { "User" }
             }
-            $scheduleKey = "${roleTemplateId}:$($member.Id)"
 
-            # Determine PIM assignment status without fabricating values
+            $scheduleKey = "${roleTemplateId}:${pId}"
+
             $assignmentType = "Unknown"
             $isPimEligible = "Unknown"
             if ($pimTelemetryAvailable) {
-                if ($pimEligibleKeys.ContainsKey($scheduleKey)) {
-                    $assignmentType = "Eligible (PIM)"
-                    $isPimEligible = $true
+                $isEligible = $pimEligibleByKey.ContainsKey($scheduleKey)
+                $assignObj = if ($pimAssignmentByKey.ContainsKey($scheduleKey)) { $pimAssignmentByKey[$scheduleKey] } else { $null }
+
+                $hasEndDate = $false
+                if ($null -ne $assignObj) {
+                    if ($assignObj.PSObject.Properties['EndDateTime'] -and $null -ne $assignObj.EndDateTime) {
+                        $hasEndDate = $true
+                    }
+                    elseif ($assignObj.PSObject.Properties['ScheduleInfo'] -and $assignObj.ScheduleInfo -and
+                            $assignObj.ScheduleInfo.PSObject.Properties['Expiration'] -and $assignObj.ScheduleInfo.Expiration -and
+                            $null -ne $assignObj.ScheduleInfo.Expiration.EndDateTime) {
+                        $hasEndDate = $true
+                    }
                 }
-                elseif ($pimPermanentKeys.ContainsKey($scheduleKey)) {
-                    $assignmentType = "Permanent"
+
+                if ($isEligible) {
+                    $isPimEligible = $true
+                    $assignmentType = if ($isActiveNow) { "Eligible (Active)" } else { "Eligible (Inactive)" }
+                }
+                elseif ($hasEndDate) {
                     $isPimEligible = $false
+                    $assignmentType = "TimeBoundAssigned"
                 }
                 else {
-                    $assignmentType = "Permanent"
                     $isPimEligible = $false
+                    $assignmentType = "Permanent"
                 }
             }
 
-            # Determine MFA status without fabricating values
             $mfaStatus = "Unknown"
             if ($principalType -eq "ServicePrincipal") {
                 $mfaStatus = "N/A (ServicePrincipal)"
@@ -356,7 +547,7 @@ function Get-LivePrivilegedRole {
             }
             elseif ($mfaTelemetryAvailable) {
                 $upnKey = $principalName.ToLowerInvariant()
-                $idKey = ([string]$member.Id).ToLowerInvariant()
+                $idKey = $pId.ToLowerInvariant()
                 if ($mfaLookup.ContainsKey($upnKey)) {
                     $mfaStatus = $mfaLookup[$upnKey]
                 }
@@ -365,7 +556,6 @@ function Get-LivePrivilegedRole {
                 }
             }
 
-            # Evaluate ComplianceRisk based on verified telemetry
             $riskReasons = [System.Collections.Generic.List[string]]::new()
             if ($principalType -eq "ServicePrincipal") {
                 $riskReasons.Add("ServicePrincipalDirectRoleAssignment")
@@ -408,18 +598,43 @@ function Get-LiveInactiveLicense {
     $results = [System.Collections.Generic.List[PSObject]]::new()
     $nowUtc = [DateTime]::UtcNow
 
-    $users = Get-MgUser -Filter "userType eq 'Member'" -Property Id, UserPrincipalName, DisplayName, AccountEnabled, AssignedLicenses, SignInActivity -All -ErrorAction Stop
+    $skuMap = @{}
+    if (Get-Command -Name Get-MgSubscribedSku -ErrorAction SilentlyContinue) {
+        try {
+            $skus = @(Get-MgSubscribedSku -All -ErrorAction Stop)
+            foreach ($s in $skus) {
+                if ($s.SkuId -and $s.SkuPartNumber) {
+                    $skuMap[[string]$s.SkuId] = [string]$s.SkuPartNumber
+                }
+            }
+        }
+        catch {
+            Write-Verbose "Unable to query SubscribedSkus: $_"
+        }
+    }
+
+    $users = Get-MgUser -Filter "userType eq 'Member'" -Property Id, UserPrincipalName, DisplayName, AccountEnabled, CreatedDateTime, AssignedLicenses, SignInActivity -All -ErrorAction Stop
     foreach ($u in $users) {
         $licenseCount = @($u.AssignedLicenses).Count
         if ($licenseCount -eq 0) { continue }
 
-        $lastSignIn = $null
-        if ($u.PSObject.Properties['SignInActivity'] -and $u.SignInActivity -and $u.SignInActivity.LastSignInDateTime) {
-            $lastSignIn = ([DateTime]$u.SignInActivity.LastSignInDateTime).ToUniversalTime()
+        $lastSignIn = Get-MostRecentSignInDateUtc -User $u
+        $createdUtc = if ($u.PSObject.Properties['CreatedDateTime'] -and $u.CreatedDateTime) {
+            ([DateTime]$u.CreatedDateTime).ToUniversalTime()
+        }
+        else {
+            $nowUtc.AddDays(-($ThresholdDays + 1))
         }
 
-        $daysInactive = if ($lastSignIn) { [int][Math]::Floor(($nowUtc - $lastSignIn).TotalDays) } else { $ThresholdDays + 1 }
-        $skuList = ($u.AssignedLicenses | ForEach-Object { $_.SkuId }) -join "; "
+        # Use CreatedDateTime as the baseline when the user has never signed in,
+        # preventing newly provisioned employees from being flagged as ReclaimableLicense on day 1.
+        $referenceDate = if ($null -ne $lastSignIn) { $lastSignIn } else { $createdUtc }
+        $daysInactive = [int][Math]::Floor(($nowUtc - $referenceDate).TotalDays)
+
+        $resolvedSkus = foreach ($lic in @($u.AssignedLicenses)) {
+            Resolve-FriendlySkuName -SkuIdentifier ([string]$lic.SkuId) -TenantSkuMap $skuMap
+        }
+        $skuList = ($resolvedSkus) -join "; "
 
         if (-not $u.AccountEnabled) {
             $results.Add([PSCustomObject]@{
@@ -427,7 +642,7 @@ function Get-LiveInactiveLicense {
                 DisplayName           = $u.DisplayName
                 AccountEnabled        = $false
                 AssignedLicenses      = $skuList
-                LastSignInDateTimeUtc = if ($lastSignIn) { $lastSignIn.ToString("o") } else { "Unknown" }
+                LastSignInDateTimeUtc = if ($null -ne $lastSignIn) { $lastSignIn.ToString("o") } else { "NeverSignedIn" }
                 DaysInactive          = $daysInactive
                 CostOptimization      = "DisabledAccountWithActiveLicense"
             })
@@ -438,7 +653,7 @@ function Get-LiveInactiveLicense {
                 DisplayName           = $u.DisplayName
                 AccountEnabled        = $true
                 AssignedLicenses      = $skuList
-                LastSignInDateTimeUtc = if ($lastSignIn) { $lastSignIn.ToString("o") } else { "Unknown" }
+                LastSignInDateTimeUtc = if ($null -ne $lastSignIn) { $lastSignIn.ToString("o") } else { "NeverSignedIn" }
                 DaysInactive          = $daysInactive
                 CostOptimization      = "ReclaimableLicense"
             })
@@ -506,18 +721,175 @@ function Get-LiveConditionalAccess {
             "None"
         }
 
-        $risk = switch ($pol.State) {
-            "disabled"                          { "PolicyDisabled" }
-            "enabledForReportingButNotEnforced" { "PolicyInReportOnlyMode" }
-            default                             { "None" }
+        $includeUsers = @()
+        $excludeUsers = @()
+        $excludeGroups = @()
+        if ($pol.PSObject.Properties['Conditions'] -and $pol.Conditions -and
+            $pol.Conditions.PSObject.Properties['Users'] -and $pol.Conditions.Users) {
+            $uCond = $pol.Conditions.Users
+            if ($uCond.PSObject.Properties['IncludeUsers'] -and $uCond.IncludeUsers) {
+                $includeUsers = @($uCond.IncludeUsers)
+            }
+            if ($uCond.PSObject.Properties['ExcludeUsers'] -and $uCond.ExcludeUsers) {
+                $excludeUsers = @($uCond.ExcludeUsers)
+            }
+            if ($uCond.PSObject.Properties['ExcludeGroups'] -and $uCond.ExcludeGroups) {
+                $excludeGroups = @($uCond.ExcludeGroups)
+            }
+        }
+
+        $scopeLabel = if ('All' -in $includeUsers) { 'All' } elseif ($includeUsers.Count -gt 0) { 'SpecificUsers' } else { 'GroupsOrRoles' }
+        $excludedCount = $excludeUsers.Count + $excludeGroups.Count
+
+        $risks = [System.Collections.Generic.List[string]]::new()
+        switch ($pol.State) {
+            "disabled"                          { $risks.Add("PolicyDisabled") }
+            "enabledForReportingButNotEnforced" { $risks.Add("PolicyInReportOnlyMode") }
+        }
+
+        if ($pol.State -eq "enabled") {
+            if ($scopeLabel -eq 'All' -and $excludedCount -eq 0) {
+                $risks.Add("NoBreakGlassExclusionConfigured")
+            }
+            elseif ($excludeUsers.Count -gt 5) {
+                $risks.Add("ExcessiveDirectUserExclusions($($excludeUsers.Count))")
+            }
         }
 
         $results.Add([PSCustomObject]@{
-            PolicyName    = $pol.DisplayName
-            State         = [string]$pol.State
-            GrantControls = $controls
-            PostureRisk   = $risk
+            PolicyName         = $pol.DisplayName
+            State              = [string]$pol.State
+            IncludeUsersScope  = $scopeLabel
+            ExcludedUsersCount = $excludedCount
+            GrantControls      = $controls
+            PostureRisk        = if ($risks.Count -gt 0) { $risks -join "; " } else { "None" }
         })
+    }
+
+    return , $results.ToArray()
+}
+
+function Get-LiveAppConsentAndSecret {
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param (
+        [Parameter(Mandatory = $false)]
+        [int]$ExpiryWarningDays = 30
+    )
+
+    $results = [System.Collections.Generic.List[PSObject]]::new()
+    $nowUtc = [DateTime]::UtcNow
+    $highRiskScopes = @('Mail.ReadWrite', 'Mail.Send', 'Directory.ReadWrite.All', 'RoleManagement.ReadWrite.Directory', 'Files.ReadWrite.All', 'full_access_as_app')
+
+    $grantsByClient = @{}
+    if (Get-Command -Name Get-MgOauth2PermissionGrant -ErrorAction SilentlyContinue) {
+        try {
+            $grants = Get-MgOauth2PermissionGrant -All -ErrorAction Stop
+            foreach ($g in $grants) {
+                $clientId = [string]$g.ClientId
+                if (-not $grantsByClient.ContainsKey($clientId)) {
+                    $grantsByClient[$clientId] = [System.Collections.Generic.List[PSObject]]::new()
+                }
+                $grantsByClient[$clientId].Add($g)
+            }
+        }
+        catch {
+            Write-Warning "Unable to query OAuth2 permission grants: $_"
+        }
+    }
+
+    $spIdByAppId = @{}
+    if (Get-Command -Name Get-MgServicePrincipal -ErrorAction SilentlyContinue) {
+        try {
+            $sps = Get-MgServicePrincipal -All -ErrorAction Stop
+            foreach ($sp in $sps) {
+                if ($sp.AppId -and $sp.Id) {
+                    $spIdByAppId[[string]$sp.AppId] = [string]$sp.Id
+                }
+            }
+        }
+        catch {
+            Write-Warning "Unable to query Service Principals: $_"
+        }
+    }
+
+    $apps = @(Get-MgApplication -All -ErrorAction Stop)
+    foreach ($app in $apps) {
+        $risks = [System.Collections.Generic.List[string]]::new()
+        $grantedScopes = [System.Collections.Generic.List[string]]::new()
+        $consentType = "None"
+
+        $resolvedSpId = if ($spIdByAppId.ContainsKey([string]$app.AppId)) {
+            $spIdByAppId[[string]$app.AppId]
+        }
+        elseif ($app.PSObject.Properties['ServicePrincipalId'] -and $app.ServicePrincipalId) {
+            [string]$app.ServicePrincipalId
+        }
+        else {
+            $null
+        }
+
+        if ($null -ne $resolvedSpId -and $grantsByClient.ContainsKey($resolvedSpId)) {
+            foreach ($grant in $grantsByClient[$resolvedSpId]) {
+                if ($grant.ConsentType -eq 'AllPrincipals') {
+                    $consentType = "AllPrincipals (AdminConsent)"
+                }
+                elseif ($consentType -eq "None") {
+                    $consentType = [string]$grant.ConsentType
+                }
+
+                $scopes = ([string]$grant.Scope -split '\s+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                foreach ($s in $scopes) {
+                    if (-not $grantedScopes.Contains($s)) {
+                        $grantedScopes.Add($s)
+                    }
+                    if ($s -in $highRiskScopes -and (-not $risks.Contains("HighRiskOAuthPermissions"))) {
+                        $risks.Add("HighRiskOAuthPermissions")
+                    }
+                }
+            }
+        }
+
+        $earliestExpiry = $null
+        $creds = @()
+        if ($app.PSObject.Properties['PasswordCredentials'] -and $app.PasswordCredentials) {
+            $creds += @($app.PasswordCredentials)
+        }
+        if ($app.PSObject.Properties['KeyCredentials'] -and $app.KeyCredentials) {
+            $creds += @($app.KeyCredentials)
+        }
+
+        foreach ($cred in $creds) {
+            if ($cred.EndDateTime) {
+                $endUtc = ([DateTime]$cred.EndDateTime).ToUniversalTime()
+                if ($null -eq $earliestExpiry -or $endUtc -lt $earliestExpiry) {
+                    $earliestExpiry = $endUtc
+                }
+            }
+        }
+
+        $daysUntilExpiry = $null
+        if ($null -ne $earliestExpiry) {
+            $daysUntilExpiry = [int][Math]::Floor(($earliestExpiry - $nowUtc).TotalDays)
+            if ($daysUntilExpiry -lt 0) {
+                $risks.Add("ExpiredClientSecret")
+            }
+            elseif ($daysUntilExpiry -le $ExpiryWarningDays) {
+                $risks.Add("CredentialExpiringSoon")
+            }
+        }
+
+        if ($risks.Count -gt 0) {
+            $results.Add([PSCustomObject]@{
+                AppDisplayName      = $app.DisplayName
+                AppId               = $app.AppId
+                ConsentType         = $consentType
+                GrantedPermissions  = if ($grantedScopes.Count -gt 0) { $grantedScopes -join "; " } else { "None" }
+                CredentialExpiryUtc = if ($null -ne $earliestExpiry) { $earliestExpiry.ToString("o") } else { "NoCredentials" }
+                DaysUntilExpiry     = if ($null -ne $daysUntilExpiry) { $daysUntilExpiry } else { "N/A" }
+                GovernanceRisk      = $risks -join "; "
+            })
+        }
     }
 
     return , $results.ToArray()
@@ -550,6 +922,7 @@ else {
         InactiveLicenses   = Get-LiveInactiveLicense -ThresholdDays $InactiveDaysThreshold
         EndpointCompliance = Get-LiveEndpointCompliance
         ConditionalAccess  = Get-LiveConditionalAccess
+        AppRegistrations   = Get-LiveAppConsentAndSecret
     }
 }
 
@@ -560,7 +933,7 @@ if (-not (Test-Path -LiteralPath $OutputDirectory)) {
 $summaryReport = [PSCustomObject]@{
     Metadata = [PSCustomObject]@{
         ToolName              = "M365-Entra-Audit-Toolkit"
-        ToolVersion           = "1.1.2"
+        ToolVersion           = "1.2.0"
         TimestampUtc          = $executionTimestampUtc
         InactiveDaysThreshold = $InactiveDaysThreshold
         ExecutionMode         = $effectiveMode
@@ -571,12 +944,14 @@ $summaryReport = [PSCustomObject]@{
         TotalReclaimableLicenses     = @($auditResults.InactiveLicenses).Count
         TotalNonCompliantEndpoints   = @($auditResults.EndpointCompliance | Where-Object { $_.ComplianceState -ne 'Compliant' }).Count
         TotalAtRiskCaPolicies        = @($auditResults.ConditionalAccess | Where-Object { $_.PostureRisk -ne 'None' }).Count
+        TotalHighRiskAppsFound       = @($auditResults.AppRegistrations).Count
     }
     StaleGuests        = $auditResults.StaleGuests
     PrivilegedRoles    = $auditResults.PrivilegedRoles
     InactiveLicenses   = $auditResults.InactiveLicenses
     EndpointCompliance = $auditResults.EndpointCompliance
     ConditionalAccess  = $auditResults.ConditionalAccess
+    AppRegistrations   = $auditResults.AppRegistrations
 }
 
 $timestampFileStr = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss")
@@ -592,11 +967,12 @@ $hashPath = Join-Path -Path $OutputDirectory -ChildPath $hashFileName
 [System.IO.File]::WriteAllText($hashPath, "$reportHash  $jsonFileName`n", [System.Text.Encoding]::UTF8)
 
 if ($ExportCsv) {
-    $auditResults.StaleGuests | Export-Csv -Path (Join-Path $OutputDirectory "StaleGuests_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
-    $auditResults.PrivilegedRoles | Export-Csv -Path (Join-Path $OutputDirectory "PrivilegedRoles_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
-    $auditResults.InactiveLicenses | Export-Csv -Path (Join-Path $OutputDirectory "InactiveLicenses_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
-    $auditResults.EndpointCompliance | Export-Csv -Path (Join-Path $OutputDirectory "EndpointCompliance_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
-    $auditResults.ConditionalAccess | Export-Csv -Path (Join-Path $OutputDirectory "ConditionalAccess_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
+    (ConvertTo-SafeCsvRecord -InputObjects @($auditResults.StaleGuests)) | Export-Csv -Path (Join-Path $OutputDirectory "StaleGuests_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
+    (ConvertTo-SafeCsvRecord -InputObjects @($auditResults.PrivilegedRoles)) | Export-Csv -Path (Join-Path $OutputDirectory "PrivilegedRoles_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
+    (ConvertTo-SafeCsvRecord -InputObjects @($auditResults.InactiveLicenses)) | Export-Csv -Path (Join-Path $OutputDirectory "InactiveLicenses_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
+    (ConvertTo-SafeCsvRecord -InputObjects @($auditResults.EndpointCompliance)) | Export-Csv -Path (Join-Path $OutputDirectory "EndpointCompliance_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
+    (ConvertTo-SafeCsvRecord -InputObjects @($auditResults.ConditionalAccess)) | Export-Csv -Path (Join-Path $OutputDirectory "ConditionalAccess_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
+    (ConvertTo-SafeCsvRecord -InputObjects @($auditResults.AppRegistrations)) | Export-Csv -Path (Join-Path $OutputDirectory "AppRegistrations_${timestampFileStr}.csv") -NoTypeInformation -Encoding UTF8
 }
 
 return [PSCustomObject]@{
@@ -609,4 +985,5 @@ return [PSCustomObject]@{
     ReclaimableLicenseCount  = $summaryReport.Summary.TotalReclaimableLicenses
     NonCompliantDeviceCount  = $summaryReport.Summary.TotalNonCompliantEndpoints
     AtRiskCaPolicyCount      = $summaryReport.Summary.TotalAtRiskCaPolicies
+    HighRiskAppCount         = $summaryReport.Summary.TotalHighRiskAppsFound
 }

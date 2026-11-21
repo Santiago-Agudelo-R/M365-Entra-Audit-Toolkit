@@ -5,27 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-21
+
+### Fixed
+- **PIM Eligible & Time-Bound Role Modeling (`Get-LivePrivilegedRole` — `Q1`):** Added inactive PIM-eligible principals from `Get-MgRoleManagementDirectoryRoleEligibilitySchedule` directly into the role evaluation map (reporting `Eligible (Active)` vs `Eligible (Inactive)`), and inspected `EndDateTime` / `ScheduleInfo.Expiration` on `Get-MgRoleManagementDirectoryRoleAssignmentSchedule` so time-bound assigned roles are classified as `TimeBoundAssigned` rather than `Permanent`.
+- **Non-Interactive Sign-In Activity & Newly Provisioned Licensed Users (`Get-LiveInactiveLicense` / `Get-LiveStaleGuest` — `Q2`, `Q3`):** Added `Get-MostRecentSignInDateUtc` evaluating `LastSuccessfulSignInDateTime`, `LastSignInDateTime`, and `LastNonInteractiveSignInDateTime`. Users who have never signed in now use `CreatedDateTime` as their inactivity baseline instead of `$ThresholdDays + 1`.
+- **SKU Friendly Name Resolution & Conditional Access Scope/Exclusions (`Q4`):** Added `Resolve-FriendlySkuName` via `Get-MgSubscribedSku` so live mode outputs human-readable license names (`Microsoft 365 E5`, `Microsoft Entra ID P2`), and expanded `Get-LiveConditionalAccess` to audit `IncludeUsersScope`, break-glass exclusions, and excessive direct user exclusions.
+- **CSV Formula Injection Mitigation (`Protect-CsvValue` — `S3`):** Sanitized string fields starting with `=`, `+`, `-`, `@`, `\t`, or `\r` prior to `Export-Csv` (`CWE-1236`).
+
+### Added
+- **OAuth App Consent & Service Principal Credential Hygiene (`Get-LiveAppConsentAndSecret`):** Audits application registrations (`Get-MgApplication`), service principals (`Get-MgServicePrincipal`), and tenant-wide OAuth2 permission grants (`Get-MgOauth2PermissionGrant`) for high-risk permissions and expired or expiring client secrets.
+
 ## [1.1.2] - 2026-11-09
 
 ### Fixed
-- **Privileged role risk evaluation:** Comparing a verified MFA value (`$true`) with `"Unknown"` was coerced to `$true` by PowerShell, so admins with confirmed MFA were flagged `UnverifiedPimAndMfaPosture` when PIM data was unavailable. The comparison now puts the string on the left side.
+- **Privileged role risk evaluation:** Comparing a verified MFA value (`$true`) with `"Unknown"` was coerced to `$true` by PowerShell, so admins with confirmed MFA were flagged `UnverifiedPimAndMfaPosture` when PIM data was unavailable.
 - **Group principals:** Role assignments to role-assignable groups are now reported as `PrincipalType = "Group"` instead of `"User"`.
 
 ## [1.1.1] - 2026-10-18
 
 ### Fixed
-- **Privileged Role MFA & PIM Verification (`Get-LivePrivilegedRole`):** Replaced hardcoded `AssignmentType = "Permanent"`, `IsPimEligible = $false`, and `MfaRegistered = $true` values with live queries against `Get-MgReportAuthenticationMethodUserRegistrationDetail`, `Get-MgRoleManagementDirectoryRoleEligibilitySchedule`, and `Get-MgRoleManagementDirectoryRoleAssignmentSchedule`. When PIM or MFA report endpoints are inaccessible, fields now return `"Unknown"` instead of fabricating compliant values.
-- **Fail-Closed Live Execution:** Running `Invoke-M365EntraAudit.ps1` without `-DemoMode` when no Microsoft Graph session is active now throws a terminating error instead of silently falling back to synthetic `contoso.com` demo telemetry.
-- **OS-Aware Encryption Flagging (`Get-LiveEndpointCompliance`):** `BitLockerNotActive` is now reported strictly for Windows endpoints (`OperatingSystem -match '^Windows'`), while unencrypted macOS/mobile devices report `DeviceEncryptionNotActive`.
-- **PSScriptAnalyzer Singular Noun Compliance:** Renamed internal cmdlets (`Get-LiveStaleGuest`, `Get-LivePrivilegedRole`, `Get-LiveInactiveLicense`) to adhere to PowerShell singular-noun conventions (`PSUseSingularNouns`).
-
-### Added
-- Unit tests in `tests/Invoke-M365EntraAudit.Tests.ps1` verifying fail-closed behavior on unauthenticated live runs and mocking Microsoft Graph cmdlets for `Get-LivePrivilegedRole` and `Get-LiveEndpointCompliance`.
+- Live queries for MFA registration and PIM schedules, fail-closed unauthenticated execution, and OS-aware BitLocker flagging.
 
 ## [1.1.0] - 2026-10-18
 
 ### Added
-- Live Microsoft Graph query implementations and Conditional Access policy posture auditing (`ConditionalAccess` section).
+- Live Microsoft Graph query implementations and Conditional Access policy posture auditing.
 
 ## [1.0.0] - 2026-10-13
 

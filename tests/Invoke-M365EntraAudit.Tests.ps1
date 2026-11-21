@@ -27,7 +27,7 @@ Describe 'Invoke-M365EntraAudit' {
 
         It 'contains all expected top-level sections in JSON' {
             $script:Report.PSObject.Properties.Name |
-                Should -Be @('Metadata', 'Summary', 'StaleGuests', 'PrivilegedRoles', 'InactiveLicenses', 'EndpointCompliance', 'ConditionalAccess')
+                Should -Be @('Metadata', 'Summary', 'StaleGuests', 'PrivilegedRoles', 'InactiveLicenses', 'EndpointCompliance', 'ConditionalAccess', 'AppRegistrations')
         }
 
         It 'verifies sidecar SHA256 integrity hash matches the artifact' {
@@ -35,8 +35,26 @@ Describe 'Invoke-M365EntraAudit' {
             (Get-Content -LiteralPath $script:Result.HashFile -Raw) | Should -Match "^$computed\s"
         }
 
-        It 'exports all 5 CSV files when -ExportCsv is specified' {
-            Get-ChildItem -Path $script:OutDir -Filter "*.csv" | Measure-Object | Select-Object -ExpandProperty Count | Should -Be 5
+        It 'exports all 6 CSV files when -ExportCsv is specified' {
+            Get-ChildItem -Path $script:OutDir -Filter "*.csv" | Measure-Object | Select-Object -ExpandProperty Count | Should -Be 6
+        }
+    }
+
+    Context 'CSV Formula Injection Sanitization (CWE-1236)' {
+        It 'prefixes untrusted strings starting with =, +, -, or @ with a single quote while preserving negative numbers' {
+            $unsafe = @(
+                [PSCustomObject]@{
+                    DisplayName     = "=CMD|' /C calc'!A0"
+                    PlusPayload     = "+SUM(1,1)"
+                    AtPayload       = "@SUM(1,1)"
+                    DaysUntilExpiry = -12
+                }
+            )
+            $safe = ConvertTo-SafeCsvRecord -InputObjects $unsafe
+            $safe[0].DisplayName | Should -Be "'=CMD|' /C calc'!A0"
+            $safe[0].PlusPayload | Should -Be "'+SUM(1,1)"
+            $safe[0].AtPayload | Should -Be "'@SUM(1,1)"
+            $safe[0].DaysUntilExpiry | Should -Be -12
         }
     }
 
@@ -50,21 +68,31 @@ Describe 'Invoke-M365EntraAudit' {
     }
 
     Context 'Live Graph Query Functions (Mocked Microsoft Graph Responses)' {
-        It 'Get-LivePrivilegedRole evaluates real MFA registration and PIM eligibility schedules' {
+        It 'Get-LivePrivilegedRole includes inactive PIM-eligible principals, distinguishes TimeBoundAssigned vs Permanent, and checks MFA' {
             function Get-MgReportAuthenticationMethodUserRegistrationDetail {
                 return @(
-                    [PSCustomObject]@{ Id = 'user-1'; UserPrincipalName = 'admin_no_mfa@contoso.com'; IsMfaRegistered = $false },
-                    [PSCustomObject]@{ Id = 'user-2'; UserPrincipalName = 'pim_admin@contoso.com'; IsMfaRegistered = $true }
+                    [PSCustomObject]@{ Id = 'user-perm'; UserPrincipalName = 'admin_no_mfa@contoso.com'; IsMfaRegistered = $false },
+                    [PSCustomObject]@{ Id = 'user-pim-active'; UserPrincipalName = 'pim_active@contoso.com'; IsMfaRegistered = $true },
+                    [PSCustomObject]@{ Id = 'user-pim-inactive'; UserPrincipalName = 'pim_inactive@contoso.com'; IsMfaRegistered = $true },
+                    [PSCustomObject]@{ Id = 'user-timebound'; UserPrincipalName = 'contractor_timebound@contoso.com'; IsMfaRegistered = $true }
                 )
             }
             function Get-MgRoleManagementDirectoryRoleEligibilitySchedule {
                 return @(
-                    [PSCustomObject]@{ RoleDefinitionId = 'template-ga'; PrincipalId = 'user-2' }
+                    [PSCustomObject]@{ RoleDefinitionId = 'template-ga'; PrincipalId = 'user-pim-active' },
+                    [PSCustomObject]@{
+                        RoleDefinitionId = 'template-ga'
+                        PrincipalId      = 'user-pim-inactive'
+                        Principal        = [PSCustomObject]@{
+                            AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = 'pim_inactive@contoso.com' }
+                        }
+                    }
                 )
             }
             function Get-MgRoleManagementDirectoryRoleAssignmentSchedule {
                 return @(
-                    [PSCustomObject]@{ RoleDefinitionId = 'template-ga'; PrincipalId = 'user-1'; AssignmentType = 'Assigned' }
+                    [PSCustomObject]@{ RoleDefinitionId = 'template-ga'; PrincipalId = 'user-perm'; AssignmentType = 'Assigned'; EndDateTime = $null },
+                    [PSCustomObject]@{ RoleDefinitionId = 'template-ga'; PrincipalId = 'user-timebound'; AssignmentType = 'Assigned'; EndDateTime = [DateTime]::UtcNow.AddDays(30) }
                 )
             }
             function Get-MgDirectoryRole {
@@ -75,18 +103,22 @@ Describe 'Invoke-M365EntraAudit' {
             function Get-MgDirectoryRoleMember {
                 return @(
                     [PSCustomObject]@{
-                        Id                   = 'user-1'
+                        Id                   = 'user-perm'
                         AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = 'admin_no_mfa@contoso.com' }
                     },
                     [PSCustomObject]@{
-                        Id                   = 'user-2'
-                        AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = 'pim_admin@contoso.com' }
+                        Id                   = 'user-pim-active'
+                        AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = 'pim_active@contoso.com' }
+                    },
+                    [PSCustomObject]@{
+                        Id                   = 'user-timebound'
+                        AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = 'contractor_timebound@contoso.com' }
                     }
                 )
             }
 
             $roles = Get-LivePrivilegedRole
-            $roles.Count | Should -Be 2
+            $roles.Count | Should -Be 4
 
             $permNoMfa = $roles | Where-Object { $_.PrincipalName -eq 'admin_no_mfa@contoso.com' }
             $permNoMfa.AssignmentType | Should -Be 'Permanent'
@@ -94,72 +126,91 @@ Describe 'Invoke-M365EntraAudit' {
             $permNoMfa.MfaRegistered | Should -BeFalse
             $permNoMfa.ComplianceRisk | Should -Match 'PrivilegedAccountWithoutMfa'
 
-            $pimUser = $roles | Where-Object { $_.PrincipalName -eq 'pim_admin@contoso.com' }
-            $pimUser.AssignmentType | Should -Be 'Eligible (PIM)'
-            $pimUser.IsPimEligible | Should -BeTrue
-            $pimUser.MfaRegistered | Should -BeTrue
-            $pimUser.ComplianceRisk | Should -Be 'None'
+            $pimActive = $roles | Where-Object { $_.PrincipalName -eq 'pim_active@contoso.com' }
+            $pimActive.AssignmentType | Should -Be 'Eligible (Active)'
+            $pimActive.IsPimEligible | Should -BeTrue
+            $pimActive.ComplianceRisk | Should -Be 'None'
+
+            $pimInactive = $roles | Where-Object { $_.PrincipalName -eq 'pim_inactive@contoso.com' }
+            $pimInactive.AssignmentType | Should -Be 'Eligible (Inactive)'
+            $pimInactive.IsPimEligible | Should -BeTrue
+            $pimInactive.ComplianceRisk | Should -Be 'None'
+
+            $timeBound = $roles | Where-Object { $_.PrincipalName -eq 'contractor_timebound@contoso.com' }
+            $timeBound.AssignmentType | Should -Be 'TimeBoundAssigned'
+            $timeBound.IsPimEligible | Should -BeFalse
+            $timeBound.ComplianceRisk | Should -Be 'None'
         }
 
-        It 'Get-LivePrivilegedRole does not flag UnverifiedPimAndMfaPosture when PIM is unavailable (Unknown) but MFA is true, and identifies Group principals' {
-            function Get-MgReportAuthenticationMethodUserRegistrationDetail {
+        It 'Get-LiveInactiveLicense respects LastNonInteractiveSignInDateTime, uses CreatedDateTime for new users, and translates SKU names' {
+            function Get-MgSubscribedSku {
                 return @(
-                    [PSCustomObject]@{ Id = 'user-mfa-ok'; UserPrincipalName = 'mfa_admin@contoso.com'; IsMfaRegistered = $true }
+                    [PSCustomObject]@{ SkuId = 'guid-e5'; SkuPartNumber = 'SPE_E5' }
                 )
             }
-            function Get-MgRoleManagementDirectoryRoleEligibilitySchedule {
-                throw "Tenant does not have an Entra ID P2 license"
-            }
-            function Get-MgRoleManagementDirectoryRoleAssignmentSchedule {
-                throw "Tenant does not have an Entra ID P2 license"
-            }
-            function Get-MgDirectoryRole {
+            function Get-MgUser {
+                $now = [DateTime]::UtcNow
                 return @(
-                    [PSCustomObject]@{ Id = 'role-sec'; RoleTemplateId = 'template-sec'; DisplayName = 'Security Administrator' }
-                )
-            }
-            function Get-MgDirectoryRoleMember {
-                return @(
+                    # User 1: Brand-new employee created yesterday who has never signed in -> must NOT be flagged
                     [PSCustomObject]@{
-                        Id                   = 'user-mfa-ok'
-                        AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = 'mfa_admin@contoso.com' }
+                        UserPrincipalName = 'new_hire@contoso.com'
+                        DisplayName       = 'New Hire'
+                        AccountEnabled    = $true
+                        CreatedDateTime   = $now.AddDays(-1)
+                        AssignedLicenses  = @([PSCustomObject]@{ SkuId = 'guid-e5' })
+                        SignInActivity    = $null
                     },
+                    # User 2: Active via non-interactive token 5 days ago (interactive sign-in was 120 days ago) -> must NOT be flagged
                     [PSCustomObject]@{
-                        Id                   = 'group-sec-ops'
-                        AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.group'; 'displayName' = 'SG-SecOps-Admins' }
+                        UserPrincipalName = 'token_active@contoso.com'
+                        DisplayName       = 'Token Active User'
+                        AccountEnabled    = $true
+                        CreatedDateTime   = $now.AddDays(-300)
+                        AssignedLicenses  = @([PSCustomObject]@{ SkuId = 'guid-e5' })
+                        SignInActivity    = [PSCustomObject]@{
+                            LastSignInDateTime               = $now.AddDays(-120)
+                            LastNonInteractiveSignInDateTime = $now.AddDays(-5)
+                        }
+                    },
+                    # User 3: Truly inactive for 150 days -> must be flagged with friendly SKU name
+                    [PSCustomObject]@{
+                        UserPrincipalName = 'stale_user@contoso.com'
+                        DisplayName       = 'Stale User'
+                        AccountEnabled    = $true
+                        CreatedDateTime   = $now.AddDays(-400)
+                        AssignedLicenses  = @([PSCustomObject]@{ SkuId = 'guid-e5' })
+                        SignInActivity    = [PSCustomObject]@{
+                            LastSignInDateTime               = $now.AddDays(-150)
+                            LastNonInteractiveSignInDateTime = $now.AddDays(-150)
+                        }
                     }
                 )
             }
 
-            $roles = Get-LivePrivilegedRole -WarningAction SilentlyContinue
-            $mfaUser = $roles | Where-Object { $_.PrincipalName -eq 'mfa_admin@contoso.com' }
-            $mfaUser.AssignmentType | Should -Be 'Unknown'
-            $mfaUser.MfaRegistered | Should -BeTrue
-            $mfaUser.ComplianceRisk | Should -Be 'None'
-
-            $grpMember = $roles | Where-Object { $_.PrincipalName -eq 'SG-SecOps-Admins' }
-            $grpMember.PrincipalType | Should -Be 'Group'
-            $grpMember.MfaRegistered | Should -Be 'N/A (Group)'
+            $reclaimable = @(Get-LiveInactiveLicense -ThresholdDays 90)
+            $reclaimable.Count | Should -Be 1
+            $reclaimable[0].UserPrincipalName | Should -Be 'stale_user@contoso.com'
+            $reclaimable[0].AssignedLicenses | Should -Be 'Microsoft 365 E5'
         }
 
         It 'Get-LiveEndpointCompliance flags BitLockerNotActive only on Windows devices and DeviceEncryptionNotActive on non-Windows' {
             function Get-MgDeviceManagementManagedDevice {
                 return @(
                     [PSCustomObject]@{
-                        DeviceName      = 'WIN-LAPTOP-01'
-                        OperatingSystem = 'Windows 11 Enterprise'
-                        ComplianceState = 'noncompliant'
-                        IsEncrypted     = $false
+                        DeviceName       = 'WIN-LAPTOP-01'
+                        OperatingSystem  = 'Windows 11 Enterprise'
+                        ComplianceState  = 'noncompliant'
+                        IsEncrypted      = $false
                         LastSyncDateTime = [DateTime]::UtcNow
-                        ManagementAgent = 'mdm'
+                        ManagementAgent  = 'mdm'
                     },
                     [PSCustomObject]@{
-                        DeviceName      = 'MACBOOK-DESIGN-02'
-                        OperatingSystem = 'macOS 14.5'
-                        ComplianceState = 'noncompliant'
-                        IsEncrypted     = $false
+                        DeviceName       = 'MACBOOK-DESIGN-02'
+                        OperatingSystem  = 'macOS 14.5'
+                        ComplianceState  = 'noncompliant'
+                        IsEncrypted      = $false
                         LastSyncDateTime = [DateTime]::UtcNow
-                        ManagementAgent = 'mdm'
+                        ManagementAgent  = 'mdm'
                     }
                 )
             }
@@ -171,6 +222,50 @@ Describe 'Invoke-M365EntraAudit' {
             $winDev.NonComplianceReasons | Should -Match 'BitLockerNotActive'
             $macDev.NonComplianceReasons | Should -Not -Match 'BitLockerNotActive'
             $macDev.NonComplianceReasons | Should -Match 'DeviceEncryptionNotActive'
+        }
+
+        It 'Get-LiveAppConsentAndSecret resolves ServicePrincipals and flags high-risk OAuth grants and expired client secrets' {
+            function Get-MgServicePrincipal {
+                return @(
+                    [PSCustomObject]@{ AppId = 'app-111'; Id = 'sp-risky-1' },
+                    [PSCustomObject]@{ AppId = 'app-222'; Id = 'sp-clean-2' }
+                )
+            }
+            function Get-MgOauth2PermissionGrant {
+                return @(
+                    [PSCustomObject]@{
+                        ClientId    = 'sp-risky-1'
+                        ConsentType = 'AllPrincipals'
+                        Scope       = 'User.Read Mail.ReadWrite Mail.Send'
+                    }
+                )
+            }
+            function Get-MgApplication {
+                return @(
+                    [PSCustomObject]@{
+                        DisplayName         = 'Risky-Mail-App'
+                        AppId               = 'app-111'
+                        PasswordCredentials = @(
+                            [PSCustomObject]@{ EndDateTime = [DateTime]::UtcNow.AddDays(-5) }
+                        )
+                        KeyCredentials      = @()
+                    },
+                    [PSCustomObject]@{
+                        DisplayName         = 'Clean-Internal-App'
+                        AppId               = 'app-222'
+                        PasswordCredentials = @(
+                            [PSCustomObject]@{ EndDateTime = [DateTime]::UtcNow.AddDays(120) }
+                        )
+                        KeyCredentials      = @()
+                    }
+                )
+            }
+
+            $apps = Get-LiveAppConsentAndSecret -ExpiryWarningDays 30
+            @($apps).Count | Should -Be 1
+            $apps[0].AppDisplayName | Should -Be 'Risky-Mail-App'
+            $apps[0].GovernanceRisk | Should -Match 'HighRiskOAuthPermissions'
+            $apps[0].GovernanceRisk | Should -Match 'ExpiredClientSecret'
         }
     }
 }

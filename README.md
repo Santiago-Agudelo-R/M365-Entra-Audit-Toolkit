@@ -11,31 +11,16 @@ Automated PowerShell governance and security auditor for Microsoft 365, Microsof
 
 ## Overview
 
-Maintaining hygiene across cloud and hybrid Microsoft enterprise tenants is critical to preventing unauthorized persistence and minimizing licensing overhead. `M365-Entra-Audit-Toolkit` provides a modular PowerShell auditor designed for systems administrators and security operations teams to evaluate five critical governance domains:
+Maintaining hygiene across cloud and hybrid Microsoft enterprise tenants is critical to preventing unauthorized persistence and minimizing licensing overhead. `M365-Entra-Audit-Toolkit` provides a modular PowerShell auditor designed for systems administrators and security operations teams to evaluate six critical governance domains:
 
-1. **Stale Guest Accounts (`Get-LiveStaleGuest`):** Identifies external vendor and partner accounts with no interactive sign-ins over a configurable threshold (default: 90 days) via `SignInActivity`.
-2. **Privileged Roles Governance (`Get-LivePrivilegedRole`):** Audits high-risk directory roles (`Global Administrator`, `Privileged Role Administrator`, `Security Administrator`, `Intune Administrator`), correlating active assignments against Entra ID PIM eligibility schedules (`Get-MgRoleManagementDirectoryRoleEligibilitySchedule`) and MFA registration status (`Get-MgReportAuthenticationMethodUserRegistrationDetail`). If PIM or MFA report permissions are unavailable, fields report `"Unknown"` rather than assuming compliance.
-3. **License Optimization (`Get-LiveInactiveLicense`):** Flags active Microsoft 365 licenses assigned to disabled (`AccountEnabled = false`) or long-inactive accounts to eliminate recurring licensing waste.
+1. **Stale Guest Accounts (`Get-LiveStaleGuest`):** Identifies external vendor and partner accounts with no sign-in activity over a configurable threshold (default: 90 days), evaluating `LastSuccessfulSignInDateTime`, `LastSignInDateTime` (interactive), and `LastNonInteractiveSignInDateTime` (token refresh).
+2. **Privileged Roles Governance (`Get-LivePrivilegedRole`):** Audits high-risk directory roles (`Global Administrator`, `Privileged Role Administrator`, `Security Administrator`, `Intune Administrator`, `Exchange Administrator`, `Conditional Access Administrator`), combining active role members (`Get-MgDirectoryRoleMember`), **both active and inactive PIM eligibility schedules** (`Get-MgRoleManagementDirectoryRoleEligibilitySchedule`), and PIM assignment expiration schedules (`Get-MgRoleManagementDirectoryRoleAssignmentSchedule` to distinguish `TimeBoundAssigned` vs `Permanent`) alongside live MFA registration status (`Get-MgReportAuthenticationMethodUserRegistrationDetail`).
+3. **License Optimization (`Get-LiveInactiveLicense`):** Flags active Microsoft 365 licenses assigned to disabled (`AccountEnabled = false`) or long-inactive accounts (checking both interactive and non-interactive sign-ins, using `CreatedDateTime` as the baseline for accounts that have never signed in so newly created employees are not flagged, and translating `SkuId` GUIDs to friendly SKU names via `Get-MgSubscribedSku`).
 4. **Intune Endpoint Posture (`Get-LiveEndpointCompliance`):** Extracts non-compliant managed devices (`Get-MgDeviceManagementManagedDevice`), flagging missing BitLocker encryption (`BitLockerNotActive`) on Windows endpoints and `DeviceEncryptionNotActive` on macOS/mobile endpoints.
-5. **Conditional Access Posture (`Get-LiveConditionalAccess`):** Evaluates Entra ID Conditional Access policies (`Get-MgIdentityConditionalAccessPolicy`) to identify policies left in `enabledForReportingButNotEnforced` (Report-Only) or `disabled` states.
+5. **Conditional Access Posture (`Get-LiveConditionalAccess`):** Evaluates Entra ID Conditional Access policies (`Get-MgIdentityConditionalAccessPolicy`) to identify policies left in `enabledForReportingButNotEnforced` (Report-Only) or `disabled` states, as well as `All`-user policies lacking break-glass exclusions or carrying excessive direct user exclusions.
+6. **OAuth App Consent & Credential Hygiene (`Get-LiveAppConsentAndSecret`):** Maps `Get-MgApplication` to `Get-MgServicePrincipal` and `Get-MgOauth2PermissionGrant` to flag high-risk tenant-wide permissions (`Mail.ReadWrite`, `Mail.Send`, `Directory.ReadWrite.All`, `RoleManagement.ReadWrite.Directory`) and expired or soon-to-expire client secrets/certificates.
 
-All extracted timestamps are normalized to ISO 8601 UTC. Outputs are delivered in structured JSON accompanied by a `.sha256` integrity sidecar file, with optional CSV exports.
-
----
-
-## Architecture
-
-```text
-[Microsoft Graph API / Intune] ─── queries ───> [Invoke-M365EntraAudit.ps1]
-                                                          │
-                                                          ▼
-                                             [Evaluation & Triage Engine]
-                                                          │
-                                     ┌────────────────────┴────────────────────┐
-                                     ▼                                         ▼
-                        [Hashed JSON Artifact]                     [Segmented CSV Reports]
-                        (Metadata + SHA256 Sidecar)          (Guests, Roles, Licenses, Intune, CA)
-```
+All extracted timestamps are normalized to ISO 8601 UTC. Outputs are delivered in structured JSON accompanied by a `.sha256` integrity sidecar file, with optional CSV exports protected against CSV/Excel formula injection (`CWE-1236`).
 
 ---
 
@@ -43,11 +28,12 @@ All extracted timestamps are normalized to ISO 8601 UTC. Outputs are delivered i
 
 ### Minimum Requirements
 - Windows, Linux, or macOS running PowerShell 7+ (or Windows PowerShell 5.1)
-- Microsoft Graph PowerShell SDK (`Microsoft.Graph.Users`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Identity.Governance`, `Microsoft.Graph.Reports`, `Microsoft.Graph.DeviceManagement`, `Microsoft.Graph.Identity.SignIns`)
+- Microsoft Graph PowerShell SDK (`Microsoft.Graph.Users`, `Microsoft.Graph.Applications`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Identity.Governance`, `Microsoft.Graph.Reports`, `Microsoft.Graph.DeviceManagement`, `Microsoft.Graph.Identity.SignIns`)
 
 ### Required Microsoft Graph Scopes (Live Execution)
 - `User.Read.All`
 - `Directory.Read.All`
+- `Application.Read.All`
 - `RoleManagement.Read.Directory` (for PIM schedule evaluation)
 - `UserAuthenticationMethod.Read.All` (for MFA registration verification)
 - `DeviceManagementManagedDevices.Read.All`
@@ -72,7 +58,7 @@ Evaluate the tool using built-in synthetic enterprise telemetry:
 ### 3. Live Tenant Execution
 Live execution requires an active Microsoft Graph session and terminates with an error if unauthenticated:
 ```powershell
-Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "RoleManagement.Read.Directory", "UserAuthenticationMethod.Read.All", "DeviceManagementManagedDevices.Read.All", "Policy.Read.All", "AuditLog.Read.All"
+Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "Application.Read.All", "RoleManagement.Read.Directory", "UserAuthenticationMethod.Read.All", "DeviceManagementManagedDevices.Read.All", "Policy.Read.All", "AuditLog.Read.All"
 .\src\Invoke-M365EntraAudit.ps1 -ExportCsv
 ```
 
@@ -80,14 +66,14 @@ Connect-MgGraph -Scopes "User.Read.All", "Directory.Read.All", "RoleManagement.R
 
 ## Sample Output (`M365Audit_<timestamp>.json`)
 
-Real output of `.\src\Invoke-M365EntraAudit.ps1 -DemoMode` (metadata and summary; the detail sections `StaleGuests`, `PrivilegedRoles`, `InactiveLicenses`, `EndpointCompliance`, and `ConditionalAccess` follow in the same file):
+Real output of `.\src\Invoke-M365EntraAudit.ps1 -DemoMode`:
 
 ```json
 {
   "Metadata": {
     "ToolName": "M365-Entra-Audit-Toolkit",
-    "ToolVersion": "1.1.2",
-    "TimestampUtc": "2026-11-14T04:07:45.2597788Z",
+    "ToolVersion": "1.2.0",
+    "TimestampUtc": "2026-11-21T20:30:00.0000000Z",
     "InactiveDaysThreshold": 90,
     "ExecutionMode": "DemoMode"
   },
@@ -96,7 +82,8 @@ Real output of `.\src\Invoke-M365EntraAudit.ps1 -DemoMode` (metadata and summary
     "TotalPrivilegedAssignments": 3,
     "TotalReclaimableLicenses": 2,
     "TotalNonCompliantEndpoints": 2,
-    "TotalAtRiskCaPolicies": 2
+    "TotalAtRiskCaPolicies": 2,
+    "TotalHighRiskAppsFound": 2
   }
 }
 ```
