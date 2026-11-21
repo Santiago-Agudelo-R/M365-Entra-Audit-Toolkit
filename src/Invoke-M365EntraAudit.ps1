@@ -460,8 +460,8 @@ function Get-LivePrivilegedRole {
             foreach ($eligKey in $pimEligibleByKey.Keys) {
                 $eligObj = $pimEligibleByKey[$eligKey]
                 if ([string]$eligObj.RoleDefinitionId -eq $roleTemplateId) {
-                    $pId = [string]$eligObj.PrincipalId
-                    if (-not $principalsById.Contains($pId)) {
+                    $principalId = [string]$eligObj.PrincipalId
+                    if (-not $principalsById.Contains($principalId)) {
                         $synthProps = if ($eligObj.PSObject.Properties['Principal'] -and $eligObj.Principal -and $eligObj.Principal.PSObject.Properties['AdditionalProperties']) {
                             $eligObj.Principal.AdditionalProperties
                         }
@@ -469,10 +469,10 @@ function Get-LivePrivilegedRole {
                             @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = [string]$eligObj.PrincipalPrincipalName }
                         }
                         else {
-                            @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = $pId }
+                            @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = $principalId }
                         }
-                        $principalsById[$pId] = [PSCustomObject]@{
-                            MemberObject = [PSCustomObject]@{ Id = $pId; AdditionalProperties = $synthProps }
+                        $principalsById[$principalId] = [PSCustomObject]@{
+                            MemberObject = [PSCustomObject]@{ Id = $principalId; AdditionalProperties = $synthProps }
                             IsActiveNow  = $false
                         }
                     }
@@ -480,8 +480,8 @@ function Get-LivePrivilegedRole {
             }
         }
 
-        foreach ($pId in $principalsById.Keys) {
-            $entryInfo = $principalsById[$pId]
+        foreach ($principalId in $principalsById.Keys) {
+            $entryInfo = $principalsById[$principalId]
             $member = $entryInfo.MemberObject
             $isActiveNow = [bool]$entryInfo.IsActiveNow
 
@@ -504,7 +504,7 @@ function Get-LivePrivilegedRole {
                 default                             { "User" }
             }
 
-            $scheduleKey = "${roleTemplateId}:${pId}"
+            $scheduleKey = "${roleTemplateId}:${principalId}"
 
             $assignmentType = "Unknown"
             $isPimEligible = "Unknown"
@@ -547,7 +547,7 @@ function Get-LivePrivilegedRole {
             }
             elseif ($mfaTelemetryAvailable) {
                 $upnKey = $principalName.ToLowerInvariant()
-                $idKey = $pId.ToLowerInvariant()
+                $idKey = $principalId.ToLowerInvariant()
                 if ($mfaLookup.ContainsKey($upnKey)) {
                     $mfaStatus = $mfaLookup[$upnKey]
                 }
