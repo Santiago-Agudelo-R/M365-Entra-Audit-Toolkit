@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-11-21
+
+### Fixed
+- **Privileged roles:** Roles are enumerated from role definitions instead of `Get-MgDirectoryRole`. A `directoryRole` object only exists once a role has been activated in the tenant, so a role held only through PIM eligibility was previously invisible.
+- **App consent:** The audit only looked at delegated permissions (`OAuth2PermissionGrant`) on app registrations owned by the tenant. It now also checks application permissions granted on Microsoft Graph and Exchange Online, covers third-party multi-tenant apps, and separates tenant-wide from user consent.
+- **App consent:** Credential findings are based on active credentials. An app with one expired secret and one valid secret is reported as `ExpiredCredentialNotRemoved` instead of `ExpiredClientSecret`; `AllCredentialsExpired` is reported only when nothing valid remains.
+- **App consent:** Fixed a null reference when an app had only one kind of delegated consent.
+
+### Changed
+- `AppRegistrations` rows now include `Publisher`, `ApplicationPermissions`, `TenantWideDelegatedPermissions` and `UserConsentedPermissions`; DemoMode data uses the same shape as live output.
+
 ## [1.2.0] - 2026-11-21
 
 ### Fixed

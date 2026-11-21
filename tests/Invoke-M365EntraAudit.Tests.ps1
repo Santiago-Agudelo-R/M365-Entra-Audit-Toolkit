@@ -95,6 +95,9 @@ Describe 'Invoke-M365EntraAudit' {
                     [PSCustomObject]@{ RoleDefinitionId = 'template-ga'; PrincipalId = 'user-timebound'; AssignmentType = 'Assigned'; EndDateTime = [DateTime]::UtcNow.AddDays(30) }
                 )
             }
+            function Get-MgRoleManagementDirectoryRoleDefinition {
+                return @([PSCustomObject]@{ Id = 'template-ga'; TemplateId = 'template-ga'; DisplayName = 'Global Administrator' })
+            }
             function Get-MgDirectoryRole {
                 return @(
                     [PSCustomObject]@{ Id = 'role-ga'; RoleTemplateId = 'template-ga'; DisplayName = 'Global Administrator' }
@@ -140,6 +143,34 @@ Describe 'Invoke-M365EntraAudit' {
             $timeBound.AssignmentType | Should -Be 'TimeBoundAssigned'
             $timeBound.IsPimEligible | Should -BeFalse
             $timeBound.ComplianceRisk | Should -Be 'None'
+        }
+
+        It 'Get-LivePrivilegedRole reports PIM-eligible holders of a role that was never activated' {
+            function Get-MgReportAuthenticationMethodUserRegistrationDetail {
+                return @([PSCustomObject]@{ Id = 'user-eligible'; UserPrincipalName = 'eligible_pra@contoso.com'; IsMfaRegistered = $true })
+            }
+            function Get-MgRoleManagementDirectoryRoleEligibilitySchedule {
+                return @([PSCustomObject]@{
+                        RoleDefinitionId = 'template-pra'
+                        PrincipalId      = 'user-eligible'
+                        Principal        = [PSCustomObject]@{
+                            AdditionalProperties = @{ '@odata.type' = '#microsoft.graph.user'; 'userPrincipalName' = 'eligible_pra@contoso.com' }
+                        }
+                    })
+            }
+            function Get-MgRoleManagementDirectoryRoleAssignmentSchedule { return @() }
+            function Get-MgRoleManagementDirectoryRoleDefinition {
+                return @([PSCustomObject]@{ Id = 'template-pra'; TemplateId = 'template-pra'; DisplayName = 'Privileged Role Administrator' })
+            }
+            # No directoryRole object exists because nobody has ever activated the role.
+            function Get-MgDirectoryRole { return @() }
+            function Get-MgDirectoryRoleMember { throw 'should not be called for a role that was never activated' }
+
+            $roles = Get-LivePrivilegedRole
+            $roles.Count | Should -Be 1
+            $roles[0].RoleName | Should -Be 'Privileged Role Administrator'
+            $roles[0].PrincipalName | Should -Be 'eligible_pra@contoso.com'
+            $roles[0].AssignmentType | Should -Be 'Eligible (Inactive)'
         }
 
         It 'Get-LiveInactiveLicense respects LastNonInteractiveSignInDateTime, uses CreatedDateTime for new users, and translates SKU names' {
@@ -224,48 +255,64 @@ Describe 'Invoke-M365EntraAudit' {
             $macDev.NonComplianceReasons | Should -Match 'DeviceEncryptionNotActive'
         }
 
-        It 'Get-LiveAppConsentAndSecret resolves ServicePrincipals and flags high-risk OAuth grants and expired client secrets' {
+        It 'Get-LiveAppConsentAndSecret flags application permissions, third-party apps, user consent and credential hygiene' {
+            $graphAppId = '00000003-0000-0000-c000-000000000000'
+            $mailReadWriteRoleId = 'e2a3a72e-5f79-4c64-b1b1-878b674786c9'
+            function Get-MgContext { return [PSCustomObject]@{ TenantId = 'tenant-home' } }
             function Get-MgServicePrincipal {
                 return @(
-                    [PSCustomObject]@{ AppId = 'app-111'; Id = 'sp-risky-1' },
-                    [PSCustomObject]@{ AppId = 'app-222'; Id = 'sp-clean-2' }
+                    [PSCustomObject]@{
+                        Id = 'sp-graph'; AppId = $graphAppId; DisplayName = 'Microsoft Graph'; AppOwnerOrganizationId = 'f8cdef31-a31e-4b4a-93e4-5f571e91255a'
+                        AppRoles = @([PSCustomObject]@{ Id = $mailReadWriteRoleId; Value = 'Mail.ReadWrite' })
+                    },
+                    [PSCustomObject]@{ Id = 'sp-thirdparty'; AppId = 'app-thirdparty'; DisplayName = 'Mail Archiver SaaS'; AppOwnerOrganizationId = 'tenant-vendor' },
+                    [PSCustomObject]@{ Id = 'sp-internal'; AppId = 'app-internal'; DisplayName = 'HR-Sync'; AppOwnerOrganizationId = 'tenant-home' },
+                    [PSCustomObject]@{ Id = 'sp-userapp'; AppId = 'app-userapp'; DisplayName = 'PDF Converter'; AppOwnerOrganizationId = 'tenant-other' },
+                    [PSCustomObject]@{ Id = 'sp-clean'; AppId = 'app-clean'; DisplayName = 'Clean-App'; AppOwnerOrganizationId = 'tenant-home' }
                 )
+            }
+            function Get-MgServicePrincipalAppRoleAssignedTo {
+                param ([string]$ServicePrincipalId, [switch]$All)
+                $null = $All
+                if ($ServicePrincipalId -ne 'sp-graph') { return @() }
+                return @([PSCustomObject]@{ PrincipalId = 'sp-thirdparty'; PrincipalType = 'ServicePrincipal'; AppRoleId = $mailReadWriteRoleId })
             }
             function Get-MgOauth2PermissionGrant {
                 return @(
-                    [PSCustomObject]@{
-                        ClientId    = 'sp-risky-1'
-                        ConsentType = 'AllPrincipals'
-                        Scope       = 'User.Read Mail.ReadWrite Mail.Send'
-                    }
+                    [PSCustomObject]@{ ClientId = 'sp-userapp'; ConsentType = 'Principal'; Scope = 'Mail.Read offline_access' },
+                    [PSCustomObject]@{ ClientId = 'sp-clean'; ConsentType = 'AllPrincipals'; Scope = 'User.Read' }
                 )
             }
             function Get-MgApplication {
                 return @(
                     [PSCustomObject]@{
-                        DisplayName         = 'Risky-Mail-App'
-                        AppId               = 'app-111'
+                        AppId = 'app-internal'; DisplayName = 'HR-Sync'; KeyCredentials = @()
                         PasswordCredentials = @(
-                            [PSCustomObject]@{ EndDateTime = [DateTime]::UtcNow.AddDays(-5) }
+                            [PSCustomObject]@{ EndDateTime = [DateTime]::UtcNow.AddDays(-5) },
+                            [PSCustomObject]@{ EndDateTime = [DateTime]::UtcNow.AddDays(10) }
                         )
-                        KeyCredentials      = @()
                     },
                     [PSCustomObject]@{
-                        DisplayName         = 'Clean-Internal-App'
-                        AppId               = 'app-222'
-                        PasswordCredentials = @(
-                            [PSCustomObject]@{ EndDateTime = [DateTime]::UtcNow.AddDays(120) }
-                        )
-                        KeyCredentials      = @()
+                        AppId = 'app-clean'; DisplayName = 'Clean-App'; KeyCredentials = @()
+                        PasswordCredentials = @([PSCustomObject]@{ EndDateTime = [DateTime]::UtcNow.AddDays(200) })
                     }
                 )
             }
 
             $apps = Get-LiveAppConsentAndSecret -ExpiryWarningDays 30
-            @($apps).Count | Should -Be 1
-            $apps[0].AppDisplayName | Should -Be 'Risky-Mail-App'
-            $apps[0].GovernanceRisk | Should -Match 'HighRiskOAuthPermissions'
-            $apps[0].GovernanceRisk | Should -Match 'ExpiredClientSecret'
+            @($apps.AppDisplayName) | Should -Be @('HR-Sync', 'Mail Archiver SaaS', 'PDF Converter')
+
+            $vendor = $apps | Where-Object AppDisplayName -eq 'Mail Archiver SaaS'
+            $vendor.Publisher | Should -Be 'ThirdParty'
+            $vendor.ApplicationPermissions | Should -Be 'Mail.ReadWrite'
+            $vendor.GovernanceRisk | Should -Be 'HighRiskApplicationPermissions'
+
+            $userApp = $apps | Where-Object AppDisplayName -eq 'PDF Converter'
+            $userApp.GovernanceRisk | Should -Be 'HighRiskUserConsentedPermissions'
+
+            $internal = $apps | Where-Object AppDisplayName -eq 'HR-Sync'
+            $internal.GovernanceRisk | Should -Be 'CredentialExpiringSoon; ExpiredCredentialNotRemoved'
+            $internal.DaysUntilExpiry | Should -BeIn @(9, 10)
         }
     }
 }

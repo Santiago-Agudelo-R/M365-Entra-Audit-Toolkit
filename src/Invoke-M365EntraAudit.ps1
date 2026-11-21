@@ -320,22 +320,26 @@ function Get-MockTelemetry {
 
     $appRegistrations = @(
         [PSCustomObject]@{
-            AppDisplayName      = "Legacy-Mail-Sync-Connector"
-            AppId               = "11111111-2222-3333-4444-555555555555"
-            ConsentType         = "AllPrincipals (AdminConsent)"
-            GrantedPermissions  = "Mail.ReadWrite; Mail.Send; User.Read.All"
-            CredentialExpiryUtc = $nowUtc.AddDays(-12).ToString("o")
-            DaysUntilExpiry     = -12
-            GovernanceRisk      = "HighRiskOAuthPermissions; ExpiredClientSecret"
+            AppDisplayName                 = "Legacy-Mail-Sync-Connector"
+            AppId                          = "11111111-2222-3333-4444-555555555555"
+            Publisher                      = "ThisTenant"
+            ApplicationPermissions         = "Mail.ReadWrite; Mail.Send"
+            TenantWideDelegatedPermissions = "None"
+            UserConsentedPermissions       = "None"
+            NextCredentialExpiryUtc        = "None"
+            DaysUntilExpiry                = "N/A"
+            GovernanceRisk                 = "HighRiskApplicationPermissions; AllCredentialsExpired"
         },
         [PSCustomObject]@{
-            AppDisplayName      = "HR-Onboarding-Automation"
-            AppId               = "66666666-7777-8888-9999-000000000000"
-            ConsentType         = "AllPrincipals (AdminConsent)"
-            GrantedPermissions  = "Directory.ReadWrite.All"
-            CredentialExpiryUtc = $nowUtc.AddDays(14).ToString("o")
-            DaysUntilExpiry     = 14
-            GovernanceRisk      = "HighRiskOAuthPermissions; CredentialExpiringSoon"
+            AppDisplayName                 = "PDF Converter Pro"
+            AppId                          = "66666666-7777-8888-9999-000000000000"
+            Publisher                      = "ThirdParty"
+            ApplicationPermissions         = "None"
+            TenantWideDelegatedPermissions = "None"
+            UserConsentedPermissions       = "Mail.Read; Files.ReadWrite.All; offline_access"
+            NextCredentialExpiryUtc        = "None"
+            DaysUntilExpiry                = "N/A"
+            GovernanceRisk                 = "HighRiskUserConsentedPermissions"
         }
     )
 
@@ -442,10 +446,38 @@ function Get-LivePrivilegedRole {
         }
     }
 
-    $roles = @(Get-MgDirectoryRole -All -ErrorAction Stop | Where-Object { $_.DisplayName -in $targetRoles })
-    foreach ($role in $roles) {
-        $roleTemplateId = if ($role.PSObject.Properties['RoleTemplateId'] -and $role.RoleTemplateId) { [string]$role.RoleTemplateId } else { [string]$role.Id }
-        $activeMembers = @(Get-MgDirectoryRoleMember -DirectoryRoleId $role.Id -All -ErrorAction Stop)
+    # directoryRole objects only exist for roles that have been activated in the tenant at least once.
+    # A role whose only holders are PIM-eligible may never have been activated, so the role list comes
+    # from role definitions (always present) and active members come from the matching directoryRole.
+    $activatedRoles = @{}
+    foreach ($directoryRole in @(Get-MgDirectoryRole -All -ErrorAction Stop)) {
+        $templateId = if ($directoryRole.PSObject.Properties['RoleTemplateId'] -and $directoryRole.RoleTemplateId) { [string]$directoryRole.RoleTemplateId } else { [string]$directoryRole.Id }
+        $activatedRoles[$templateId] = $directoryRole
+    }
+
+    $roleCatalog = if (Get-Command -Name Get-MgRoleManagementDirectoryRoleDefinition -ErrorAction SilentlyContinue) {
+        @(Get-MgRoleManagementDirectoryRoleDefinition -All -ErrorAction Stop |
+            Where-Object { $_.DisplayName -in $targetRoles } |
+            ForEach-Object {
+                $definitionTemplateId = if ($_.PSObject.Properties['TemplateId'] -and $_.TemplateId) { [string]$_.TemplateId } else { [string]$_.Id }
+                [PSCustomObject]@{ TemplateId = $definitionTemplateId; DisplayName = [string]$_.DisplayName }
+            })
+    }
+    else {
+        Write-Warning "Get-MgRoleManagementDirectoryRoleDefinition is unavailable; roles never activated in this tenant will be missed."
+        @($activatedRoles.Values | Where-Object { $_.DisplayName -in $targetRoles } | ForEach-Object {
+                [PSCustomObject]@{ TemplateId = [string]$_.RoleTemplateId; DisplayName = [string]$_.DisplayName }
+            })
+    }
+
+    foreach ($role in $roleCatalog) {
+        $roleTemplateId = $role.TemplateId
+        $activeMembers = if ($activatedRoles.ContainsKey($roleTemplateId)) {
+            @(Get-MgDirectoryRoleMember -DirectoryRoleId $activatedRoles[$roleTemplateId].Id -All -ErrorAction Stop)
+        }
+        else {
+            @()
+        }
 
         # Build a combined dictionary of principals for this role: active members + inactive PIM-eligible principals
         $principalsById = [ordered]@{}
@@ -770,6 +802,14 @@ function Get-LiveConditionalAccess {
 }
 
 function Get-LiveAppConsentAndSecret {
+    <#
+        Reviews every service principal in the tenant, including third-party multi-tenant apps, for:
+          - Application permissions (app roles) on Microsoft Graph and Exchange Online. These act
+            without a signed-in user and are what illicit-consent attacks aim for.
+          - Delegated permissions (OAuth2PermissionGrant), tenant-wide (AllPrincipals) or per user.
+          - Credential hygiene of app registrations owned by this tenant.
+        Only apps with at least one finding are returned.
+    #>
     [CmdletBinding()]
     [OutputType([object[]])]
     param (
@@ -779,120 +819,136 @@ function Get-LiveAppConsentAndSecret {
 
     $results = [System.Collections.Generic.List[PSObject]]::new()
     $nowUtc = [DateTime]::UtcNow
-    $highRiskScopes = @('Mail.ReadWrite', 'Mail.Send', 'Directory.ReadWrite.All', 'RoleManagement.ReadWrite.Directory', 'Files.ReadWrite.All', 'full_access_as_app')
+    $highRiskPermissions = @(
+        'Mail.Read', 'Mail.ReadWrite', 'Mail.Send', 'MailboxSettings.ReadWrite', 'full_access_as_app',
+        'Files.ReadWrite.All', 'Sites.FullControl.All', 'User.ReadWrite.All', 'Directory.ReadWrite.All',
+        'Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All', 'RoleManagement.ReadWrite.Directory'
+    )
+    $resourceAppIds = @(
+        '00000003-0000-0000-c000-000000000000', # Microsoft Graph
+        '00000002-0000-0ff1-ce00-000000000000'  # Office 365 Exchange Online
+    )
 
-    $grantsByClient = @{}
-    if (Get-Command -Name Get-MgOauth2PermissionGrant -ErrorAction SilentlyContinue) {
-        try {
-            $grants = Get-MgOauth2PermissionGrant -All -ErrorAction Stop
-            foreach ($g in $grants) {
-                $clientId = [string]$g.ClientId
-                if (-not $grantsByClient.ContainsKey($clientId)) {
-                    $grantsByClient[$clientId] = [System.Collections.Generic.List[PSObject]]::new()
-                }
-                $grantsByClient[$clientId].Add($g)
+    $tenantId = $null
+    if (Get-Command -Name Get-MgContext -ErrorAction SilentlyContinue) {
+        $context = Get-MgContext
+        if ($context -and $context.PSObject.Properties['TenantId']) { $tenantId = [string]$context.TenantId }
+    }
+
+    $servicePrincipals = @(Get-MgServicePrincipal -All -ErrorAction Stop)
+    $spById = @{}
+    foreach ($sp in $servicePrincipals) { $spById[[string]$sp.Id] = $sp }
+
+    $entries = @{}
+    $getEntry = {
+        param ([string]$AppId, [string]$DisplayName)
+        if (-not $entries.ContainsKey($AppId)) {
+            $entries[$AppId] = [PSCustomObject]@{
+                AppId                  = $AppId
+                DisplayName            = $DisplayName
+                Publisher              = 'Unknown'
+                ApplicationPermissions = [System.Collections.Generic.List[string]]::new()
+                TenantWideDelegated    = [System.Collections.Generic.List[string]]::new()
+                PerUserDelegated       = [System.Collections.Generic.List[string]]::new()
+                Credentials            = @()
             }
         }
-        catch {
-            Write-Warning "Unable to query OAuth2 permission grants: $_"
+        return $entries[$AppId]
+    }
+
+    # 1. Application permissions granted on Microsoft Graph and Exchange Online.
+    foreach ($resource in @($servicePrincipals | Where-Object { [string]$_.AppId -in $resourceAppIds })) {
+        $roleValueById = @{}
+        foreach ($appRole in @($resource.AppRoles)) {
+            if ($appRole) { $roleValueById[[string]$appRole.Id] = [string]$appRole.Value }
+        }
+
+        foreach ($assignment in @(Get-MgServicePrincipalAppRoleAssignedTo -ServicePrincipalId $resource.Id -All -ErrorAction Stop)) {
+            if ([string]$assignment.PrincipalType -ne 'ServicePrincipal') { continue }
+            $client = $spById[[string]$assignment.PrincipalId]
+            if (-not $client) { continue }
+            $permission = $roleValueById[[string]$assignment.AppRoleId]
+            if (-not $permission) { $permission = [string]$assignment.AppRoleId }
+            $entry = & $getEntry ([string]$client.AppId) ([string]$client.DisplayName)
+            if (-not $entry.ApplicationPermissions.Contains($permission)) { $entry.ApplicationPermissions.Add($permission) }
         }
     }
 
-    $spIdByAppId = @{}
-    if (Get-Command -Name Get-MgServicePrincipal -ErrorAction SilentlyContinue) {
-        try {
-            $sps = Get-MgServicePrincipal -All -ErrorAction Stop
-            foreach ($sp in $sps) {
-                if ($sp.AppId -and $sp.Id) {
-                    $spIdByAppId[[string]$sp.AppId] = [string]$sp.Id
-                }
-            }
-        }
-        catch {
-            Write-Warning "Unable to query Service Principals: $_"
+    # 2. Delegated permissions.
+    foreach ($grant in @(Get-MgOauth2PermissionGrant -All -ErrorAction Stop)) {
+        $client = $spById[[string]$grant.ClientId]
+        if (-not $client) { continue }
+        $entry = & $getEntry ([string]$client.AppId) ([string]$client.DisplayName)
+        # Assign the list itself: an if-expression would enumerate it, and an empty list would become $null.
+        $target = $entry.PerUserDelegated
+        if ($grant.ConsentType -eq 'AllPrincipals') { $target = $entry.TenantWideDelegated }
+        foreach ($scope in @(([string]$grant.Scope -split '\s+') | Where-Object { $_ })) {
+            if (-not $target.Contains($scope)) { $target.Add($scope) }
         }
     }
 
-    $apps = @(Get-MgApplication -All -ErrorAction Stop)
-    foreach ($app in $apps) {
+    # 3. Credentials of app registrations owned by this tenant.
+    foreach ($app in @(Get-MgApplication -All -ErrorAction Stop)) {
+        $credentials = @()
+        if ($app.PSObject.Properties['PasswordCredentials'] -and $app.PasswordCredentials) { $credentials += @($app.PasswordCredentials) }
+        if ($app.PSObject.Properties['KeyCredentials'] -and $app.KeyCredentials) { $credentials += @($app.KeyCredentials) }
+        $entry = & $getEntry ([string]$app.AppId) ([string]$app.DisplayName)
+        $entry.Publisher = 'ThisTenant'
+        $entry.Credentials = $credentials
+    }
+
+    foreach ($entry in $entries.Values) {
+        if ($entry.Publisher -eq 'Unknown') {
+            $sp = $servicePrincipals | Where-Object { [string]$_.AppId -eq $entry.AppId } | Select-Object -First 1
+            $owner = if ($sp -and $sp.PSObject.Properties['AppOwnerOrganizationId']) { [string]$sp.AppOwnerOrganizationId } else { '' }
+            if ($owner -and $tenantId) {
+                $entry.Publisher = if ($owner -eq $tenantId) { 'ThisTenant' } else { 'ThirdParty' }
+            }
+        }
+
         $risks = [System.Collections.Generic.List[string]]::new()
-        $grantedScopes = [System.Collections.Generic.List[string]]::new()
-        $consentType = "None"
-
-        $resolvedSpId = if ($spIdByAppId.ContainsKey([string]$app.AppId)) {
-            $spIdByAppId[[string]$app.AppId]
+        if (@($entry.ApplicationPermissions | Where-Object { $_ -in $highRiskPermissions }).Count -gt 0) {
+            $risks.Add('HighRiskApplicationPermissions')
         }
-        elseif ($app.PSObject.Properties['ServicePrincipalId'] -and $app.ServicePrincipalId) {
-            [string]$app.ServicePrincipalId
+        if (@($entry.TenantWideDelegated | Where-Object { $_ -in $highRiskPermissions }).Count -gt 0) {
+            $risks.Add('HighRiskTenantWideDelegatedPermissions')
         }
-        else {
-            $null
+        if (@($entry.PerUserDelegated | Where-Object { $_ -in $highRiskPermissions }).Count -gt 0) {
+            $risks.Add('HighRiskUserConsentedPermissions')
         }
 
-        if ($null -ne $resolvedSpId -and $grantsByClient.ContainsKey($resolvedSpId)) {
-            foreach ($grant in $grantsByClient[$resolvedSpId]) {
-                if ($grant.ConsentType -eq 'AllPrincipals') {
-                    $consentType = "AllPrincipals (AdminConsent)"
-                }
-                elseif ($consentType -eq "None") {
-                    $consentType = [string]$grant.ConsentType
-                }
+        # Credential hygiene: only active credentials decide whether the app is about to break.
+        $endDates = @($entry.Credentials | Where-Object { $_.EndDateTime } | ForEach-Object { ([DateTime]$_.EndDateTime).ToUniversalTime() })
+        $activeEndDates = @($endDates | Where-Object { $_ -gt $nowUtc } | Sort-Object)
+        $nextExpiryUtc = if ($activeEndDates.Count -gt 0) { $activeEndDates[0] } else { $null }
+        $daysUntilExpiry = if ($null -ne $nextExpiryUtc) { [int][Math]::Floor(($nextExpiryUtc - $nowUtc).TotalDays) } else { $null }
 
-                $scopes = ([string]$grant.Scope -split '\s+') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-                foreach ($s in $scopes) {
-                    if (-not $grantedScopes.Contains($s)) {
-                        $grantedScopes.Add($s)
-                    }
-                    if ($s -in $highRiskScopes -and (-not $risks.Contains("HighRiskOAuthPermissions"))) {
-                        $risks.Add("HighRiskOAuthPermissions")
-                    }
-                }
-            }
+        if ($endDates.Count -gt 0 -and $activeEndDates.Count -eq 0) {
+            $risks.Add('AllCredentialsExpired')
+        }
+        elseif ($null -ne $daysUntilExpiry -and $daysUntilExpiry -le $ExpiryWarningDays) {
+            $risks.Add('CredentialExpiringSoon')
+        }
+        if ($activeEndDates.Count -gt 0 -and $endDates.Count -gt $activeEndDates.Count) {
+            $risks.Add('ExpiredCredentialNotRemoved')
         }
 
-        $earliestExpiry = $null
-        $creds = @()
-        if ($app.PSObject.Properties['PasswordCredentials'] -and $app.PasswordCredentials) {
-            $creds += @($app.PasswordCredentials)
-        }
-        if ($app.PSObject.Properties['KeyCredentials'] -and $app.KeyCredentials) {
-            $creds += @($app.KeyCredentials)
-        }
+        if ($risks.Count -eq 0) { continue }
 
-        foreach ($cred in $creds) {
-            if ($cred.EndDateTime) {
-                $endUtc = ([DateTime]$cred.EndDateTime).ToUniversalTime()
-                if ($null -eq $earliestExpiry -or $endUtc -lt $earliestExpiry) {
-                    $earliestExpiry = $endUtc
-                }
-            }
-        }
-
-        $daysUntilExpiry = $null
-        if ($null -ne $earliestExpiry) {
-            $daysUntilExpiry = [int][Math]::Floor(($earliestExpiry - $nowUtc).TotalDays)
-            if ($daysUntilExpiry -lt 0) {
-                $risks.Add("ExpiredClientSecret")
-            }
-            elseif ($daysUntilExpiry -le $ExpiryWarningDays) {
-                $risks.Add("CredentialExpiringSoon")
-            }
-        }
-
-        if ($risks.Count -gt 0) {
-            $results.Add([PSCustomObject]@{
-                AppDisplayName      = $app.DisplayName
-                AppId               = $app.AppId
-                ConsentType         = $consentType
-                GrantedPermissions  = if ($grantedScopes.Count -gt 0) { $grantedScopes -join "; " } else { "None" }
-                CredentialExpiryUtc = if ($null -ne $earliestExpiry) { $earliestExpiry.ToString("o") } else { "NoCredentials" }
-                DaysUntilExpiry     = if ($null -ne $daysUntilExpiry) { $daysUntilExpiry } else { "N/A" }
-                GovernanceRisk      = $risks -join "; "
-            })
-        }
+        $results.Add([PSCustomObject]@{
+            AppDisplayName                = $entry.DisplayName
+            AppId                         = $entry.AppId
+            Publisher                     = $entry.Publisher
+            ApplicationPermissions        = if ($entry.ApplicationPermissions.Count -gt 0) { $entry.ApplicationPermissions -join '; ' } else { 'None' }
+            TenantWideDelegatedPermissions = if ($entry.TenantWideDelegated.Count -gt 0) { $entry.TenantWideDelegated -join '; ' } else { 'None' }
+            UserConsentedPermissions      = if ($entry.PerUserDelegated.Count -gt 0) { $entry.PerUserDelegated -join '; ' } else { 'None' }
+            NextCredentialExpiryUtc       = if ($null -ne $nextExpiryUtc) { $nextExpiryUtc.ToString('o') } else { 'None' }
+            DaysUntilExpiry               = if ($null -ne $daysUntilExpiry) { $daysUntilExpiry } else { 'N/A' }
+            GovernanceRisk                = $risks -join '; '
+        })
     }
 
-    return , $results.ToArray()
+    return , @($results | Sort-Object -Property AppDisplayName)
 }
 
 if ($LoadFunctionsOnly) {
@@ -933,7 +989,7 @@ if (-not (Test-Path -LiteralPath $OutputDirectory)) {
 $summaryReport = [PSCustomObject]@{
     Metadata = [PSCustomObject]@{
         ToolName              = "M365-Entra-Audit-Toolkit"
-        ToolVersion           = "1.2.0"
+        ToolVersion           = "1.2.1"
         TimestampUtc          = $executionTimestampUtc
         InactiveDaysThreshold = $InactiveDaysThreshold
         ExecutionMode         = $effectiveMode
