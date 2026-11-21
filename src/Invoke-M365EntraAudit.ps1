@@ -315,6 +315,14 @@ function Get-MockTelemetry {
             ExcludedUsersCount = 0
             GrantControls      = "block"
             PostureRisk        = "PolicyDisabled"
+        },
+        [PSCustomObject]@{
+            PolicyName         = "[Tenant baseline] LegacyAuthenticationNotBlocked"
+            State              = "missing"
+            IncludeUsersScope  = "Tenant"
+            ExcludedUsersCount = 0
+            GrantControls      = "None"
+            PostureRisk        = "LegacyAuthenticationNotBlocked"
         }
     )
 
@@ -737,6 +745,34 @@ function Get-LiveEndpointCompliance {
     return , $results.ToArray()
 }
 
+function Get-NestedValue {
+    # Reads a nested property path without failing under Set-StrictMode when a level is missing.
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $false)]
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$Path
+    )
+
+    $current = $InputObject
+    foreach ($name in $Path) {
+        if ($null -eq $current) { return $null }
+        if ($current -is [System.Collections.IDictionary]) {
+            $current = if ($current.Contains($name)) { $current[$name] } else { $null }
+        }
+        elseif ($current.PSObject.Properties[$name]) {
+            $current = $current.$name
+        }
+        else {
+            return $null
+        }
+    }
+    return $current
+}
+
 function Get-LiveConditionalAccess {
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -795,6 +831,65 @@ function Get-LiveConditionalAccess {
             ExcludedUsersCount = $excludedCount
             GrantControls      = $controls
             PostureRisk        = if ($risks.Count -gt 0) { $risks -join "; " } else { "None" }
+        })
+    }
+
+    # Tenant-level gaps: individual policies can all look healthy while the baseline protections
+    # are missing altogether. Security defaults provide MFA and legacy-auth blocking without CA.
+    $securityDefaultsOn = $false
+    if (Get-Command -Name Get-MgPolicyIdentitySecurityDefaultEnforcementPolicy -ErrorAction SilentlyContinue) {
+        try {
+            $securityDefaultsOn = [bool](Get-MgPolicyIdentitySecurityDefaultEnforcementPolicy -ErrorAction Stop).IsEnabled
+        }
+        catch {
+            Write-Warning "Unable to read security defaults state: $_"
+        }
+    }
+
+    $globalAdminTemplateId = '62e90394-69f5-4237-9190-012177145e10'
+    $enabledPolicies = @($policies | Where-Object { $_.State -eq 'enabled' })
+
+    $requiresMfa = {
+        param ($Policy)
+        $controls = @(Get-NestedValue -InputObject $Policy -Path 'GrantControls', 'BuiltInControls')
+        $strength = Get-NestedValue -InputObject $Policy -Path 'GrantControls', 'AuthenticationStrength', 'Id'
+        return (('mfa' -in $controls) -or (-not [string]::IsNullOrWhiteSpace([string]$strength)))
+    }
+    $targetsAllApps = {
+        param ($Policy)
+        return ('All' -in @(Get-NestedValue -InputObject $Policy -Path 'Conditions', 'Applications', 'IncludeApplications'))
+    }
+
+    $mfaForAll = @($enabledPolicies | Where-Object {
+            ('All' -in @(Get-NestedValue -InputObject $_ -Path 'Conditions', 'Users', 'IncludeUsers')) -and
+            (& $targetsAllApps $_) -and (& $requiresMfa $_)
+        })
+    $mfaForAdmins = @($enabledPolicies | Where-Object {
+            ($globalAdminTemplateId -in @(Get-NestedValue -InputObject $_ -Path 'Conditions', 'Users', 'IncludeRoles')) -and
+            (& $targetsAllApps $_) -and (& $requiresMfa $_)
+        })
+    $legacyBlock = @($enabledPolicies | Where-Object {
+            $clientApps = @(Get-NestedValue -InputObject $_ -Path 'Conditions', 'ClientAppTypes')
+            ('All' -in @(Get-NestedValue -InputObject $_ -Path 'Conditions', 'Users', 'IncludeUsers')) -and
+            ('exchangeActiveSync' -in $clientApps) -and ('other' -in $clientApps) -and
+            ('block' -in @(Get-NestedValue -InputObject $_ -Path 'GrantControls', 'BuiltInControls'))
+        })
+
+    $tenantGaps = [System.Collections.Generic.List[string]]::new()
+    if (-not $securityDefaultsOn) {
+        if ($mfaForAll.Count -eq 0) { $tenantGaps.Add('MissingMfaForAllUsers') }
+        if ($mfaForAll.Count -eq 0 -and $mfaForAdmins.Count -eq 0) { $tenantGaps.Add('MissingMfaForAdmins') }
+        if ($legacyBlock.Count -eq 0) { $tenantGaps.Add('LegacyAuthenticationNotBlocked') }
+    }
+
+    foreach ($gap in $tenantGaps) {
+        $results.Add([PSCustomObject]@{
+            PolicyName         = "[Tenant baseline] $gap"
+            State              = 'missing'
+            IncludeUsersScope  = 'Tenant'
+            ExcludedUsersCount = 0
+            GrantControls      = 'None'
+            PostureRisk        = $gap
         })
     }
 
@@ -989,7 +1084,7 @@ if (-not (Test-Path -LiteralPath $OutputDirectory)) {
 $summaryReport = [PSCustomObject]@{
     Metadata = [PSCustomObject]@{
         ToolName              = "M365-Entra-Audit-Toolkit"
-        ToolVersion           = "1.2.1"
+        ToolVersion           = "1.2.2"
         TimestampUtc          = $executionTimestampUtc
         InactiveDaysThreshold = $InactiveDaysThreshold
         ExecutionMode         = $effectiveMode

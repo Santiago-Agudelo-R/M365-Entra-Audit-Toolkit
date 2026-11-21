@@ -173,6 +173,45 @@ Describe 'Invoke-M365EntraAudit' {
             $roles[0].AssignmentType | Should -Be 'Eligible (Inactive)'
         }
 
+        It 'Get-LiveConditionalAccess reports missing tenant baselines, and none when security defaults are on' {
+            function ConvertTo-TestCaPolicy {
+                param ($Name, $State, $Users, $Controls, $ClientApps = @())
+                [PSCustomObject]@{
+                    DisplayName   = $Name
+                    State         = $State
+                    GrantControls = [PSCustomObject]@{ BuiltInControls = $Controls }
+                    Conditions    = [PSCustomObject]@{
+                        Users          = [PSCustomObject]@{ IncludeUsers = $Users; IncludeRoles = @(); ExcludeUsers = @('break-glass'); ExcludeGroups = @() }
+                        Applications   = [PSCustomObject]@{ IncludeApplications = @('All') }
+                        ClientAppTypes = $ClientApps
+                    }
+                }
+            }
+
+            # Only a report-only MFA policy: every baseline is missing.
+            function Get-MgPolicyIdentitySecurityDefaultEnforcementPolicy { [PSCustomObject]@{ IsEnabled = $false } }
+            function Get-MgIdentityConditionalAccessPolicy { @(ConvertTo-TestCaPolicy 'MFA all' 'enabledForReportingButNotEnforced' @('All') @('mfa')) }
+            $rows = Get-LiveConditionalAccess
+            @($rows | Where-Object IncludeUsersScope -eq 'Tenant').PostureRisk |
+                Should -Be @('MissingMfaForAllUsers', 'MissingMfaForAdmins', 'LegacyAuthenticationNotBlocked')
+
+            # Enforced MFA for all users and a legacy-auth block: no tenant gaps.
+            function Get-MgIdentityConditionalAccessPolicy {
+                @(
+                    (ConvertTo-TestCaPolicy 'MFA all' 'enabled' @('All') @('mfa')),
+                    (ConvertTo-TestCaPolicy 'Block legacy' 'enabled' @('All') @('block') @('exchangeActiveSync', 'other'))
+                )
+            }
+            $rows = Get-LiveConditionalAccess
+            @($rows | Where-Object IncludeUsersScope -eq 'Tenant').Count | Should -Be 0
+
+            # Security defaults cover MFA and legacy auth without Conditional Access.
+            function Get-MgPolicyIdentitySecurityDefaultEnforcementPolicy { [PSCustomObject]@{ IsEnabled = $true } }
+            function Get-MgIdentityConditionalAccessPolicy { @() }
+            $rows = Get-LiveConditionalAccess
+            @($rows | Where-Object { $_ }).Count | Should -Be 0
+        }
+
         It 'Get-LiveInactiveLicense respects LastNonInteractiveSignInDateTime, uses CreatedDateTime for new users, and translates SKU names' {
             function Get-MgSubscribedSku {
                 return @(

@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-11-21
+
+### Added
+- **Conditional Access tenant baselines:** Each policy was evaluated on its own, so a tenant with no enforced MFA policy at all looked clean. The audit now reports `MissingMfaForAllUsers`, `MissingMfaForAdmins` and `LegacyAuthenticationNotBlocked` when no enabled policy provides them, and skips these checks when security defaults are enabled.
+
+### Changed
+- Changelog entries describe each change directly instead of citing external review item numbers.
+
 ## [1.2.1] - 2026-11-21
 
 ### Fixed
@@ -19,10 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.2.0] - 2026-11-21
 
 ### Fixed
-- **PIM Eligible & Time-Bound Role Modeling (`Get-LivePrivilegedRole` — `Q1`):** Added inactive PIM-eligible principals from `Get-MgRoleManagementDirectoryRoleEligibilitySchedule` directly into the role evaluation map (reporting `Eligible (Active)` vs `Eligible (Inactive)`), and inspected `EndDateTime` / `ScheduleInfo.Expiration` on `Get-MgRoleManagementDirectoryRoleAssignmentSchedule` so time-bound assigned roles are classified as `TimeBoundAssigned` rather than `Permanent`.
-- **Non-Interactive Sign-In Activity & Newly Provisioned Licensed Users (`Get-LiveInactiveLicense` / `Get-LiveStaleGuest` — `Q2`, `Q3`):** Added `Get-MostRecentSignInDateUtc` evaluating `LastSuccessfulSignInDateTime`, `LastSignInDateTime`, and `LastNonInteractiveSignInDateTime`. Users who have never signed in now use `CreatedDateTime` as their inactivity baseline instead of `$ThresholdDays + 1`.
-- **SKU Friendly Name Resolution & Conditional Access Scope/Exclusions (`Q4`):** Added `Resolve-FriendlySkuName` via `Get-MgSubscribedSku` so live mode outputs human-readable license names (`Microsoft 365 E5`, `Microsoft Entra ID P2`), and expanded `Get-LiveConditionalAccess` to audit `IncludeUsersScope`, break-glass exclusions, and excessive direct user exclusions.
-- **CSV Formula Injection Mitigation (`Protect-CsvValue` — `S3`):** Sanitized string fields starting with `=`, `+`, `-`, `@`, `\t`, or `\r` prior to `Export-Csv` (`CWE-1236`).
+- **PIM Eligible & Time-Bound Role Modeling (`Get-LivePrivilegedRole`):** Added inactive PIM-eligible principals from `Get-MgRoleManagementDirectoryRoleEligibilitySchedule` directly into the role evaluation map (reporting `Eligible (Active)` vs `Eligible (Inactive)`), and inspected `EndDateTime` / `ScheduleInfo.Expiration` on `Get-MgRoleManagementDirectoryRoleAssignmentSchedule` so time-bound assigned roles are classified as `TimeBoundAssigned` rather than `Permanent`.
+- **Non-Interactive Sign-In Activity & Newly Provisioned Licensed Users (`Get-LiveInactiveLicense` / `Get-LiveStaleGuest`):** Added `Get-MostRecentSignInDateUtc` evaluating `LastSuccessfulSignInDateTime`, `LastSignInDateTime`, and `LastNonInteractiveSignInDateTime`. Users who have never signed in now use `CreatedDateTime` as their inactivity baseline instead of `$ThresholdDays + 1`.
+- **SKU Friendly Name Resolution & Conditional Access Scope/Exclusions:** Added `Resolve-FriendlySkuName` via `Get-MgSubscribedSku` so live mode outputs human-readable license names (`Microsoft 365 E5`, `Microsoft Entra ID P2`), and expanded `Get-LiveConditionalAccess` to audit `IncludeUsersScope`, break-glass exclusions, and excessive direct user exclusions.
+- **CSV Formula Injection Mitigation (`Protect-CsvValue`):** Sanitized string fields starting with `=`, `+`, `-`, `@`, `\t`, or `\r` prior to `Export-Csv` (`CWE-1236`).
 
 ### Added
 - **OAuth App Consent & Service Principal Credential Hygiene (`Get-LiveAppConsentAndSecret`):** Audits application registrations (`Get-MgApplication`), service principals (`Get-MgServicePrincipal`), and tenant-wide OAuth2 permission grants (`Get-MgOauth2PermissionGrant`) for high-risk permissions and expired or expiring client secrets.
